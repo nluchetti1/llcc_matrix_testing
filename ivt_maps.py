@@ -108,6 +108,15 @@ IVT_CONNECT_TIMEOUT = 15
 IVT_READ_TIMEOUT = 90
 IVT_ATTEMPTS = 3
 IVT_BUDGET_S = 900          # whole-job budget; returns what it has when spent
+IVT_CYCLE_ATTEMPTS = 2      # probe tries per candidate cycle before walking back
+# If every cycle probe fails with a TRANSIENT error (throttle, 5xx, connection), assume
+# the newest nominal cycle is fine and let the real fetch decide. NOMADS refusing a probe
+# at one moment does not mean the data is absent -- on 2026-08-31 16:08 all three models
+# reported "no usable cycle found" in ~5s flat, which is a refusal, not a missing file.
+IVT_CYCLE_FALLBACK = True
+# Give up on a model after this many consecutive step failures. Without it, a fallback to
+# a cycle that really is absent would grind through every step x every retry.
+IVT_MAX_CONSECUTIVE_FAILURES = 3
 IVT_UA = ("Mozilla/5.0 (X11; Linux x86_64; rv:120.0) "
           "Gecko/20100101 Firefox/120.0")
 
@@ -174,6 +183,8 @@ def determine_cycle(session, model):
     Probes a single level of a single variable so the check costs almost nothing."""
     cfg = IVT_MODELS[model]
     now = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=cfg["latency_h"])
+    transient = False          # did anything look like a refusal rather than a 404?
+    first_candidate = None     # newest nominal cycle, used by the fallback
     for back in range(0, 5):
         t = now - datetime.timedelta(hours=6 * back)
         cyc = max([c for c in cfg["cycles"] if c <= t.hour], default=None)
@@ -185,15 +196,45 @@ def determine_cycle(session, model):
                  f"?file={cfg['file'](cycle, 0)}&lev_500_mb=on&var_UGRD=on"
                  f"&subregion=&leftlon=-81&rightlon=-80&toplat=29&bottomlat=28"
                  f"&dir={cfg['dir'](date_str, cycle)}")
-        try:
-            r = session.get(probe, timeout=(IVT_CONNECT_TIMEOUT, 30))
+        if first_candidate is None:
+            first_candidate = (date_str, cycle)
+
+        for attempt in range(1, IVT_CYCLE_ATTEMPTS + 1):
+            try:
+                r = session.get(probe, timeout=(IVT_CONNECT_TIMEOUT, 30))
+            except Exception as e:
+                # Connection-level failure: transient by definition.
+                transient = True
+                logging.warning(f"[IVT] {model} cycle probe {date_str} {cycle}z "
+                                f"attempt {attempt}: {type(e).__name__}: {str(e)[:120]}")
+                time.sleep(2.0 * attempt)
+                continue
             if r.status_code == 200 and r.content.startswith(b"GRIB"):
                 logging.info(f"[IVT] {model}: using cycle {date_str} {cycle}z")
                 return date_str, cycle
-        except Exception:
-            pass
+            # Log WHAT failed. The old code swallowed this entirely, which made a NOMADS
+            # refusal indistinguishable from a cycle that had not posted yet.
+            if r.status_code == 200:
+                body = r.content[:140].decode("utf-8", "replace").replace("\n", " ")
+                logging.warning(f"[IVT] {model} cycle probe {date_str} {cycle}z "
+                                f"attempt {attempt}: 200 but not GRIB :: {body}")
+            else:
+                logging.warning(f"[IVT] {model} cycle probe {date_str} {cycle}z "
+                                f"attempt {attempt}: HTTP {r.status_code}")
+            # 404 means this cycle genuinely is not there -- walk back rather than retry.
+            # Anything else (403/429/5xx) is the server declining, so retry this cycle.
+            if r.status_code == 404:
+                break
+            transient = True
+            time.sleep(2.0 * attempt)
         time.sleep(1.0)
-    logging.error(f"[IVT] {model}: no usable cycle found")
+
+    if IVT_CYCLE_FALLBACK and transient and first_candidate:
+        logging.warning(f"[IVT] {model}: every cycle probe failed transiently; falling back to "
+                        f"{first_candidate[0]} {first_candidate[1]}z and letting the fetch decide")
+        return first_candidate
+    logging.error(f"[IVT] {model}: no usable cycle found "
+                  f"(transient={transient}; see the probe warnings above)")
     return None, None
 
 
@@ -397,7 +438,7 @@ def fetch_ivt_maps(models=None, session=None):
                 continue
             cycle_label = f"{date_str} {cycle}z"
             init = datetime.datetime.strptime(f"{date_str}{cycle}", "%Y%m%d%H")
-            maps, attempted = {}, 0
+            maps, attempted, consecutive_fail = {}, 0, 0
 
             for fh in cfg["steps"]:
                 if time.time() - started > IVT_BUDGET_S:
@@ -418,8 +459,14 @@ def fetch_ivt_maps(models=None, session=None):
                         logging.warning(f"[IVT] {model} f{fh:03d}: rendered without MSLP "
                                         f"contours (check the 'mslp' var name for {model})")
                 if not path:
+                    consecutive_fail += 1
+                    if consecutive_fail >= IVT_MAX_CONSECUTIVE_FAILURES:
+                        logging.error(f"[IVT] {model}: {consecutive_fail} consecutive step "
+                                      f"failures from {cycle_label}; abandoning this model")
+                        break
                     time.sleep(IVT_REQUEST_PAUSE_S)
                     continue
+                consecutive_fail = 0
                 try:
                     lons, lats, mag, iu, iv, mslp, lv = grid_ivt(path, cfg["moisture"])
                     valid = (init + datetime.timedelta(hours=fh)).strftime("%d %b %HZ")
