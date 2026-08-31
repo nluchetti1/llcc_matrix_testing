@@ -69,6 +69,7 @@ IVT_MODELS = {
         "file": lambda c, f: f"gfs.t{c}z.pgrb2.0p25.f{f:03d}",
         "dir": lambda d, c: f"%2Fgfs.{d}%2F{c}%2Fatmos",
         "moisture": "spfh",
+        "mslp": "PRMSL",
         "cycles": [0, 6, 12, 18],
         "latency_h": 4,
         "steps": list(range(0, 181, 6)),   # f000-f180 6-hourly, matching CW3E
@@ -78,7 +79,11 @@ IVT_MODELS = {
         "filter": "filter_rap.pl",
         "file": lambda c, f: f"rap.t{c}z.awp130pgrbf{f:02d}.grib2",
         "dir": lambda d, c: f"%2Frap.{d}",
+        # RAP publishes MSLMA (MAPS MSL pressure), NOT PRMSL. Asking the filter for a
+        # variable this file does not contain returns HTTP 500 -- an entire cycle of steps
+        # failed on exactly this, while determine_cycle (which requests no MSLP) succeeded.
         "moisture": "rh",                  # SPFH silently absent -- see header
+        "mslp": "MSLMA",
         "cycles": list(range(24)),
         "latency_h": 2,
         "steps": list(range(0, 22, 3)),
@@ -89,6 +94,7 @@ IVT_MODELS = {
         "file": lambda c, f: f"nam.t{c}z.awphys{f:02d}.tm00.grib2",
         "dir": lambda d, c: f"%2Fnam.{d}",
         "moisture": "rh",                  # SPFH silently absent -- see header
+        "mslp": "PRMSL",
         "cycles": [0, 6, 12, 18],
         "latency_h": 3,
         "steps": list(range(0, 85, 6)),
@@ -114,17 +120,19 @@ MSLP_INTERVAL_HPA = 4
 # ---------------------------------------------------------------------------
 # Fetch
 # ---------------------------------------------------------------------------
-def _build_url(model, date_str, cycle, fh):
+def _build_url(model, date_str, cycle, fh, with_mslp=True):
     cfg = IVT_MODELS[model]
     lev = "".join(f"&lev_{lv}_mb=on" for lv in IVT_LEVELS)
     if cfg["moisture"] == "spfh":
         var = "&var_SPFH=on"
     else:
         var = "&var_RH=on&var_TMP=on"
-    var += "&var_UGRD=on&var_VGRD=on&var_PRES=on&var_PRMSL=on"
-    # PRMSL lives on mean sea level, PRES on the surface; both need their level flags
-    # or the filter returns the isobaric-only subset and the MSLP contours vanish.
-    var += "&lev_mean_sea_level=on&lev_surface=on"
+    var += "&var_UGRD=on&var_VGRD=on&var_PRES=on&lev_surface=on"
+    if with_mslp:
+        # The MSLP variable NAME differs by model (see "mslp" above) and lives on mean sea
+        # level, so it needs its own level flag. Requesting the wrong name is fatal to the
+        # whole request, not merely to the contours -- hence the with_mslp=False retry.
+        var += f"&var_{cfg['mslp']}=on&lev_mean_sea_level=on"
     region = (f"&subregion=&leftlon={IVT_DOMAIN['left']}&rightlon={IVT_DOMAIN['right']}"
               f"&toplat={IVT_DOMAIN['top']}&bottomlat={IVT_DOMAIN['bottom']}")
     return (f"https://nomads.ncep.noaa.gov/cgi-bin/{cfg['filter']}"
@@ -236,7 +244,7 @@ def grid_ivt(filepath, route):
                 fields[(sn, g.level)] = np.asarray(g.values, dtype=np.float64)
         elif sn in ("sp", "pres") and tl == "surface":
             sfc_pres = np.asarray(g.values, dtype=np.float64) / 100.0   # Pa -> hPa
-        elif sn in ("prmsl", "msl", "mslet"):
+        elif sn in ("prmsl", "msl", "mslet", "mslma"):
             mslp = np.asarray(g.values, dtype=np.float64) / 100.0
     grbs.close()
 
@@ -398,6 +406,17 @@ def fetch_ivt_maps(models=None, session=None):
                 attempted += 1
                 path = _fetch_grib(session, _build_url(model, date_str, cycle, fh),
                                    tag=f"{model} f{fh:03d}")
+                if not path:
+                    # Degrade rather than lose the step: retry without MSLP. IVT itself needs
+                    # no sea-level pressure, so a wrong variable name should cost the contours
+                    # and nothing more.
+                    time.sleep(IVT_REQUEST_PAUSE_S)
+                    path = _fetch_grib(session,
+                                       _build_url(model, date_str, cycle, fh, with_mslp=False),
+                                       tag=f"{model} f{fh:03d} (no MSLP)")
+                    if path:
+                        logging.warning(f"[IVT] {model} f{fh:03d}: rendered without MSLP "
+                                        f"contours (check the 'mslp' var name for {model})")
                 if not path:
                     time.sleep(IVT_REQUEST_PAUSE_S)
                     continue
