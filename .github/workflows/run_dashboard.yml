@@ -73,11 +73,20 @@ jobs:
           # Surface the summary lines that say whether each data source actually worked.
           grep -E "BUFKIT:|carried forward|Skew-T export|GEFS thermo:|ECMWF ENS|ECMWF column|AWS columns merged|Launch thermo:|not caching" run.log \
             | tail -25 || echo "(no summary lines matched)"
+          echo "--- IVT ---"
+          # IVT gets its own block: the per-step warnings name the HTTP status that caused a
+          # model to be abandoned, and they are the only record of WHY a model produced no
+          # maps. Without this they were written to run.log and then discarded on success.
+          grep -E "\[IVT\]" run.log | tail -40 || echo "(no IVT lines)"
           echo "--- errors ---"
           grep -E "ERROR|Traceback" run.log | head -20 || echo "(none)"
 
-      - name: Upload run log on failure
-        if: failure()
+      # ALWAYS keep the log, not just on failure. A run can "succeed" while a whole data
+      # source produced nothing -- the IVT models were abandoned on three separate successful
+      # runs and the log explaining why was thrown away each time, because the pipeline
+      # degrades rather than crashing. Partial failure is the interesting case.
+      - name: Upload run log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: run-log-${{ github.run_number }}
