@@ -137,6 +137,8 @@ IVT_READ_TIMEOUT = 90
 IVT_ATTEMPTS = 3
 IVT_BUDGET_S = 900          # whole-job budget; returns what it has when spent
 IVT_MODEL_BUDGET_S = 420    # per-model cap, so a slow ECMWF cannot starve GFS
+IVT_THROTTLE_BACKOFF_S = 20 # 403/429/503 means NOMADS is declining; retrying in 4s
+                            # just burns the budget being refused more quickly
 IVT_CYCLE_ATTEMPTS = 2      # probe tries per candidate cycle before walking back
 # If every cycle probe fails with a TRANSIENT error (throttle, 5xx, connection), assume
 # the newest nominal cycle is fine and let the real fetch decide. NOMADS refusing a probe
@@ -178,6 +180,12 @@ def _build_url(model, date_str, cycle, fh, with_mslp=True):
             f"&dir={cfg['dir'](date_str, cycle)}")
 
 
+# Last failure reason per model, so the abandon message can say what actually happened
+# rather than only that it happened. The run.log warnings carry the detail, but the
+# workflow's post-run grep only surfaces a few lines -- this puts the cause in one of them.
+_LAST_FAIL = {}
+
+
 def _fetch_grib(session, url, tag=""):
     """GET a filter URL, verify it is really GRIB, write to a temp file.
 
@@ -189,12 +197,22 @@ def _fetch_grib(session, url, tag=""):
         try:
             r = session.get(url, timeout=(IVT_CONNECT_TIMEOUT, IVT_READ_TIMEOUT))
         except Exception as e:
+            _LAST_FAIL[tag.split()[0]] = f"{type(e).__name__}: {str(e)[:80]}"
             logging.warning(f"[IVT] {tag} attempt {attempt} request error: {e}")
             time.sleep(IVT_REQUEST_PAUSE_S * attempt)
             continue
         if r.status_code != 200:
-            logging.warning(f"[IVT] {tag} attempt {attempt} HTTP {r.status_code}")
-            time.sleep(IVT_REQUEST_PAUSE_S * attempt)
+            _LAST_FAIL[tag.split()[0]] = f"HTTP {r.status_code}"
+            # 403/429 is NOMADS declining, not a bad request. Back off much harder than the
+            # normal pause -- the standard 4s retry just spends the remaining budget being
+            # refused faster.
+            if r.status_code in (403, 429, 503):
+                logging.warning(f"[IVT] {tag} attempt {attempt} HTTP {r.status_code} "
+                                f"(throttled) - backing off {IVT_THROTTLE_BACKOFF_S * attempt}s")
+                time.sleep(IVT_THROTTLE_BACKOFF_S * attempt)
+            else:
+                logging.warning(f"[IVT] {tag} attempt {attempt} HTTP {r.status_code}")
+                time.sleep(IVT_REQUEST_PAUSE_S * attempt)
             continue
         if not r.content.startswith(b"GRIB"):
             snippet = r.content[:160].decode("utf-8", "replace").replace("\n", " ")
@@ -604,7 +622,8 @@ def fetch_ivt_maps(models=None, session=None):
                     consecutive_fail += 1
                     if consecutive_fail >= IVT_MAX_CONSECUTIVE_FAILURES:
                         logging.error(f"[IVT] {model}: {consecutive_fail} consecutive step "
-                                      f"failures from {cycle_label}; abandoning this model")
+                                      f"failures from {cycle_label}; abandoning this model "
+                                      f"(last failure: {_LAST_FAIL.get(model, 'unknown')})")
                         break
                     time.sleep(IVT_REQUEST_PAUSE_S)
                     continue
