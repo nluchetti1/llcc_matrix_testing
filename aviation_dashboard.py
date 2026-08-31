@@ -18,6 +18,11 @@ import matplotlib.colors as mcolors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
+# Integrated Vapor Transport. ivt.py is pure math (no I/O, unit-tested standalone);
+# ivt_maps.py does the NOMADS fetch + CW3E-style rendering for the spatial panels.
+from ivt import column_ivt
+import ivt_maps
+
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -1864,6 +1869,14 @@ def compute_launch_thermo(profile_layers):
         if not core:
             core = _thermo_numpy(layers)
         out.update(core)
+        # IVT rides along here because every model column in the panel passes through
+        # this function, so one call covers GFS/RAP/HRRR/ECMWF/RRFS/REFS/GEFS/ECENS.
+        # column_ivt returns None on a column too thin or too shallow to integrate,
+        # in which case the keys are simply absent and the panel renders a blank.
+        _ivt = column_ivt(layers)
+        if _ivt:
+            out["ivt"] = _ivt["ivt"]
+            out["ivt_dir"] = _ivt["ivt_dir_to"]
         return out
     except Exception:
         return {}
@@ -4783,6 +4796,13 @@ def _ensemble_thermo_row(per):
         row["pwat_in"] = round(pw, 2)
     if rh is not None:
         row["rh_700_500"] = round(rh, 1)
+    # IVT magnitude is averaged as a SCALAR, matching how Thompson and PWAT are handled
+    # here. That is the mean of the member magnitudes, not the magnitude of the mean
+    # transport vector -- the two differ whenever members disagree on direction, and the
+    # scalar mean is the one that stays comparable to the deterministic columns.
+    iv = _avg("ivt")
+    if iv is not None:
+        row["ivt"] = round(iv, 1)
     member_p = []
     for t in per:
         p = rf_lightning_prob(t.get("thompson"),
@@ -5424,7 +5444,7 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                             if _L.get("rh") is not None or _L.get("dwpt") is not None)
                 if th and _rh_n < PANEL_MIN_RH_LEVELS:
                     for _k in ("k_index", "lifted_index", "thompson", "pwat_in", "pwat_mm",
-                               "rh_700_500"):
+                               "rh_700_500", "ivt", "ivt_dir"):
                         th[_k] = None
                     th["thin_moisture"] = _rh_n
                 if not th:
@@ -5454,6 +5474,10 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                     "ti_pct": _climo_percentile(ti, THOMPSON_CLIMO_XMR.get(month), THOMPSON_PCTL_POINTS),
                     "pwat": pwat,
                     "pwat_pct": _climo_percentile(pwat, PWAT_CLIMO_XMR.get(month), PWAT_PCTL_POINTS),
+                    # No climatology table for IVT yet, so no percentile badge -- the raw
+                    # value only. Add PWAT-style monthly breaks later if it earns one.
+                    "ivt": th.get("ivt"),
+                    "ivt_dir": th.get("ivt_dir"),
                     # Tag REFS rows so the frontend can flag the mean-sounding caveat. The
                     # ensemble columns use "...N-mem" here; this is deliberately distinct.
                     # Tag the row so the panel can say which fields to trust. "thin-moisture"
@@ -5505,6 +5529,8 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                 "ti_pct": _climo_percentile(ti, THOMPSON_CLIMO_XMR.get(month), THOMPSON_PCTL_POINTS),
                 "pwat": pwat,
                 "pwat_pct": _climo_percentile(pwat, PWAT_CLIMO_XMR.get(month), PWAT_PCTL_POINTS),
+                "ivt": r.get("ivt"),
+                "ivt_dir": r.get("ivt_dir"),
                 "engine": f"metpy\u00b7{r.get('n', 0)}-mem",
             })
         if rows_out:
@@ -5591,6 +5617,17 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     # cu/anvil-governed (their own LLCC rules) rather than a stratiform thick-cloud bust. HRRR is
     # the convection truth source and the tag is applied across every model column for that
     # site-hour; the underlying thickness values are preserved so nothing is lost.
+    # Spatial IVT panels. Independent of everything below: a failure here costs the IVT
+    # maps and nothing else, which is why it gets its own try and returns {} rather than
+    # raising. GFS is the only enabled model by default -- see ivt_maps.py for why RAP/NAM
+    # are optional and HRRR/GEFS are excluded outright.
+    ivt_map_set = {}
+    if ivt_maps.IVT_MAPS_ENABLED:
+        try:
+            ivt_map_set = ivt_maps.fetch_ivt_maps()
+        except Exception as e:
+            logging.error(f"[IVT] map set failed, continuing without it: {e}")
+
     refc_maps = {}   # {row_key: "maps/refc/....png"} — backs the ANVIL hover popup
     if CONVECTIVE_MASK_ENABLED:
         try:
@@ -5843,6 +5880,8 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         "launch_thermo": launch_thermo,
         "launch_thermo_runs": thermo_runs,
         "refc_maps": refc_maps,
+        # {model: {"cycle": "YYYYMMDD HHz", "maps": {"f024": "maps/ivt/gfs/....png"}}}
+        "ivt_maps": ivt_map_set,
         # GEFS cycles 6-hourly while this runs hourly; cache the rows so the fetch is skipped
         # until a new cycle posts.
         "gefs_cache": ({"cycle": gefs_cycle_key, "rows": gefs_member_rows}
@@ -5867,7 +5906,13 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     # keep-set — the previous `{**href_maps, **ct_all_maps}` merge silently discarded density
     # maps (and ct1 maps) wherever a row key was shared, so they were pruned right after
     # being generated. That was why only a handful of density hours survived on disk.
-    referenced_paths = _collect_map_paths(href_maps, ct1_maps, ct4_maps, blank_basemap_path, refc_maps)
+    # ivt_map_set is NESTED ({model: {"maps": {...}}}), not flat like the others, so the
+    # inner dicts are handed to _collect_map_paths directly. Leaving it out entirely is the
+    # exact failure the comment above describes: the PNGs are written, then pruned in the
+    # same run, and the panel shows broken images with no error anywhere in the log.
+    _ivt_paths = [v.get("maps", {}) for v in (ivt_map_set or {}).values()]
+    referenced_paths = _collect_map_paths(href_maps, ct1_maps, ct4_maps, blank_basemap_path,
+                                          refc_maps, *_ivt_paths)
     prune_stale_maps(referenced_paths)
     logging.info("Dashboard matrix completely compiled and written to history.json.")
 
