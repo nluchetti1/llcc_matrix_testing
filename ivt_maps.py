@@ -62,9 +62,16 @@ IVT_LEVELS = [1000, 975, 950, 925, 900, 850, 800, 750, 700,
 
 # Per-model fetch recipe. `moisture` is "spfh" or "rh" and is NOT negotiable per the
 # probe results above.
+# ECMWF open data publishes only these 8 levels at or below 300 hPa (probed 2026-08-31,
+# not assumed). Integrating 8 instead of 17 biases IVT +1.3% high on a smooth column --
+# trapezoid over a convex q profile -- which is negligible against model error. A sharp dry
+# intrusion inside the 150 hPa gap between 850 and 700 would do worse.
+ECMWF_IVT_LEVELS = [1000, 925, 850, 700, 600, 500, 400, 300]
+
 IVT_MODELS = {
     "gfs": {
         "enabled": True,
+        "source": "nomads",
         "filter": "filter_gfs_0p25.pl",
         "file": lambda c, f: f"gfs.t{c}z.pgrb2.0p25.f{f:03d}",
         "dir": lambda d, c: f"%2Fgfs.{d}%2F{c}%2Fatmos",
@@ -76,6 +83,7 @@ IVT_MODELS = {
     },
     "rap": {
         "enabled": True,
+        "source": "nomads",
         "filter": "filter_rap.pl",
         "file": lambda c, f: f"rap.t{c}z.awp130pgrbf{f:02d}.grib2",
         "dir": lambda d, c: f"%2Frap.{d}",
@@ -90,6 +98,7 @@ IVT_MODELS = {
     },
     "nam": {
         "enabled": True,
+        "source": "nomads",
         "filter": "filter_nam.pl",
         "file": lambda c, f: f"nam.t{c}z.awphys{f:02d}.tm00.grib2",
         "dir": lambda d, c: f"%2Fnam.{d}",
@@ -98,6 +107,25 @@ IVT_MODELS = {
         "cycles": [0, 6, 12, 18],
         "latency_h": 3,
         "steps": list(range(0, 85, 6)),
+    },
+    # ECMWF is NOT a NOMADS model and behaves differently in three ways that matter:
+    #   * no spatial subsetting -- every step arrives as a full global 721x1440 grid, so it
+    #     costs 16.8 MB/step against GFS's 1.5 MB. Hence the coarser default step list.
+    #   * two retrieves per step (pressure levels and surface cannot come in one call).
+    #   * cycle discovery via the client's own index, not a filter probe.
+    # 6-hourly to f144 is 25 steps, ~420 MB, ~2.5 min of download. Widen or thin this list
+    # freely -- it is the single knob that trades coverage against runtime.
+    "ecmwf": {
+        "enabled": True,
+        "source": "ecmwf",
+        "moisture": "spfh",            # shortName is 'q', which _grid_moisture reads directly
+        "mslp": "msl",
+        "levels": ECMWF_IVT_LEVELS,
+        # Only 00z and 12z run the full forecast length; 06z and 18z stop near f90, which
+        # would silently truncate the map set. determine_cycle snaps back to 00/12.
+        "cycles": [0, 12],
+        "latency_h": 8,
+        "steps": list(range(0, 145, 6)),
     },
 }
 
@@ -108,6 +136,7 @@ IVT_CONNECT_TIMEOUT = 15
 IVT_READ_TIMEOUT = 90
 IVT_ATTEMPTS = 3
 IVT_BUDGET_S = 900          # whole-job budget; returns what it has when spent
+IVT_MODEL_BUDGET_S = 420    # per-model cap, so a slow ECMWF cannot starve GFS
 IVT_CYCLE_ATTEMPTS = 2      # probe tries per candidate cycle before walking back
 # If every cycle probe fails with a TRANSIENT error (throttle, 5xx, connection), assume
 # the newest nominal cycle is fine and let the real fetch decide. NOMADS refusing a probe
@@ -176,6 +205,97 @@ def _fetch_grib(session, url, tag=""):
             f.write(r.content)
         return path
     return None
+
+
+def _crop_slices(lats, lons, domain, margin=2.0):
+    """Row/col slices trimming a REGULAR lat/lon grid to the map domain.
+
+    ECMWF hands back the whole globe on every step. Integrating 8 levels x 3 params of
+    721x1440 when the map covers 40x30 degrees wastes most of the work and the memory, so
+    each field is trimmed as it is decoded rather than after. Returns None for a grid that
+    is not regular (RAP and NAM are Lambert, where a lat/lon box is not a rectangle) --
+    those arrive pre-subset from NOMADS anyway.
+    """
+    try:
+        lat1d, lon1d = lats[:, 0], lons[0, :]
+        # Regular means every row shares one longitude vector and every column one latitude.
+        if not (np.allclose(lats[0, :], lats[0, 0]) and np.allclose(lons[:, 0], lons[0, 0])):
+            return None
+        lon1d = np.where(lon1d > 180.0, lon1d - 360.0, lon1d)
+        rows = np.where((lat1d >= domain["bottom"] - margin) &
+                        (lat1d <= domain["top"] + margin))[0]
+        cols = np.where((lon1d >= domain["left"] - margin) &
+                        (lon1d <= domain["right"] + margin))[0]
+        if rows.size < 4 or cols.size < 4:
+            return None
+        return (slice(int(rows.min()), int(rows.max()) + 1),
+                slice(int(cols.min()), int(cols.max()) + 1))
+    except Exception:
+        return None
+
+
+def _ecmwf_client():
+    """Imported lazily so ivt_maps still loads when ecmwf-opendata is absent."""
+    from ecmwf.opendata import Client
+    return Client(source="ecmwf")
+
+
+def _ecmwf_cycle():
+    """Newest ECMWF cycle that runs the full forecast length.
+
+    client.latest() reports whatever is newest, including 06z and 18z -- but those stop
+    near f90, so a step list reaching f144 would come back half empty with no error. Snap
+    back to the preceding 00z or 12z instead.
+    """
+    try:
+        dt_ = _ecmwf_client().latest(type="fc", param="msl", levtype="sfc")
+    except Exception as e:
+        logging.error(f"[IVT] ecmwf: latest() failed: {type(e).__name__}: {str(e)[:160]}")
+        return None, None
+    while dt_.hour not in (0, 12):
+        dt_ = dt_ - datetime.timedelta(hours=1)
+    logging.info(f"[IVT] ecmwf: using cycle {dt_:%Y%m%d} {dt_:%H}z")
+    return dt_.strftime("%Y%m%d"), dt_.strftime("%H")
+
+
+def _fetch_ecmwf(date_str, cycle, fh, tag=""):
+    """Two retrieves per step: pressure levels, then surface. Returns [paths] or None.
+
+    They cannot be combined -- levtype is a single value per request. Both files are handed
+    to grid_ivt together, which is why it accepts a list.
+    """
+    cfg = IVT_MODELS["ecmwf"]
+    client = _ecmwf_client()
+    out = []
+    for kwargs, what in (
+        (dict(levtype="pl", levelist=cfg["levels"], param=["q", "u", "v"]), "pl"),
+        (dict(levtype="sfc", param=["sp", "msl"]), "sfc"),
+    ):
+        fd, path = tempfile.mkstemp(suffix=".grib2", prefix="ivt_ec_")
+        os.close(fd)
+        try:
+            client.retrieve(date=date_str, time=int(cycle), type="fc",
+                            step=[fh], target=path, **kwargs)
+            if os.path.getsize(path) == 0:
+                raise ValueError("empty file")
+            out.append(path)
+        except Exception as e:
+            logging.warning(f"[IVT] {tag} {what} retrieve failed: "
+                            f"{type(e).__name__}: {str(e)[:150]}")
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+            # The surface half is optional: without sp the below-ground mask degrades and
+            # without msl the contours vanish, but IVT itself still integrates.
+            if what == "pl":
+                for p in out:
+                    try:
+                        os.unlink(p)
+                    except Exception:
+                        pass
+                return None
+    return out
 
 
 def determine_cycle(session, model):
@@ -267,34 +387,46 @@ def _grid_moisture(fields, level, route):
     return w / (1.0 + w)
 
 
-def grid_ivt(filepath, route):
+def grid_ivt(filepaths, route, crop_domain=None):
     """Integrate IVT across the whole grid.
 
     Returns (lons, lats, ivt_mag, ivt_u, ivt_v, mslp_hpa, levels_used).
     Vertical integration is the same trapezoid ivt.column_ivt() uses, vectorised.
     """
+    if isinstance(filepaths, str):
+        filepaths = [filepaths]
     fields, lats, lons, sfc_pres, mslp = {}, None, None, None, None
-    grbs = pygrib.open(filepath)
-    for g in grbs:
-        sn = getattr(g, "shortName", "")
-        tl = getattr(g, "typeOfLevel", "")
-        if lats is None:
-            lats, lons = g.latlons()
-        if tl == "isobaricInhPa" and g.level in IVT_LEVELS:
-            if sn in ("q", "r", "t", "u", "v"):
-                fields[(sn, g.level)] = np.asarray(g.values, dtype=np.float64)
-        elif sn in ("sp", "pres") and tl == "surface":
-            sfc_pres = np.asarray(g.values, dtype=np.float64) / 100.0   # Pa -> hPa
-        elif sn in ("prmsl", "msl", "mslet", "mslma"):
-            mslp = np.asarray(g.values, dtype=np.float64) / 100.0
-    grbs.close()
+    sl = None                      # crop slices, computed once from the first field
+    wanted = set(IVT_LEVELS) | set(ECMWF_IVT_LEVELS)
+    for filepath in filepaths:
+        grbs = pygrib.open(filepath)
+        for g in grbs:
+            sn = getattr(g, "shortName", "")
+            tl = getattr(g, "typeOfLevel", "")
+            if lats is None:
+                lats, lons = g.latlons()
+                if crop_domain is not None:
+                    sl = _crop_slices(lats, lons, crop_domain)
+                    if sl is not None:
+                        lats, lons = lats[sl], lons[sl]
+            if tl == "isobaricInhPa" and g.level in wanted:
+                if sn in ("q", "r", "t", "u", "v"):
+                    v = np.asarray(g.values, dtype=np.float64)
+                    fields[(sn, g.level)] = v[sl] if sl is not None else v
+            elif sn in ("sp", "pres") and tl == "surface":
+                v = np.asarray(g.values, dtype=np.float64) / 100.0      # Pa -> hPa
+                sfc_pres = v[sl] if sl is not None else v
+            elif sn in ("prmsl", "msl", "mslet", "mslma"):
+                v = np.asarray(g.values, dtype=np.float64) / 100.0
+                mslp = v[sl] if sl is not None else v
+        grbs.close()
 
     if lats is None:
         raise ValueError("no fields decoded")
 
     # Levels present with a complete (moisture, u, v) triple. Descending pressure.
     usable = []
-    for lv in sorted(IVT_LEVELS, reverse=True):
+    for lv in sorted(wanted, reverse=True):
         if ("u", lv) not in fields or ("v", lv) not in fields:
             continue
         try:
@@ -433,20 +565,30 @@ def fetch_ivt_maps(models=None, session=None):
     try:
         for model in models:
             cfg = IVT_MODELS[model]
-            date_str, cycle = determine_cycle(session, model)
+            if cfg.get("source") == "ecmwf":
+                date_str, cycle = _ecmwf_cycle()
+            else:
+                date_str, cycle = determine_cycle(session, model)
             if not date_str:
                 continue
             cycle_label = f"{date_str} {cycle}z"
             init = datetime.datetime.strptime(f"{date_str}{cycle}", "%Y%m%d%H")
             maps, attempted, consecutive_fail = {}, 0, 0
 
+            model_started = time.time()
             for fh in cfg["steps"]:
                 if time.time() - started > IVT_BUDGET_S:
                     logging.warning(f"[IVT] budget spent; stopping {model} at f{fh:03d}")
                     break
+                if time.time() - model_started > IVT_MODEL_BUDGET_S:
+                    logging.warning(f"[IVT] {model} hit its own budget at f{fh:03d}")
+                    break
                 attempted += 1
-                path = _fetch_grib(session, _build_url(model, date_str, cycle, fh),
-                                   tag=f"{model} f{fh:03d}")
+                if cfg.get("source") == "ecmwf":
+                    path = _fetch_ecmwf(date_str, cycle, fh, tag=f"ecmwf f{fh:03d}")
+                else:
+                    path = _fetch_grib(session, _build_url(model, date_str, cycle, fh),
+                                       tag=f"{model} f{fh:03d}")
                 if not path:
                     # Degrade rather than lose the step: retry without MSLP. IVT itself needs
                     # no sea-level pressure, so a wrong variable name should cost the contours
@@ -468,7 +610,11 @@ def fetch_ivt_maps(models=None, session=None):
                     continue
                 consecutive_fail = 0
                 try:
-                    lons, lats, mag, iu, iv, mslp, lv = grid_ivt(path, cfg["moisture"])
+                    # Crop only the global model; NOMADS output is already subset, and RAP/NAM
+                    # are Lambert grids where a lat/lon box is not a rectangle.
+                    crop = IVT_DOMAIN if cfg.get("source") == "ecmwf" else None
+                    lons, lats, mag, iu, iv, mslp, lv = grid_ivt(path, cfg["moisture"],
+                                                                 crop_domain=crop)
                     valid = (init + datetime.timedelta(hours=fh)).strftime("%d %b %HZ")
                     rel = render_ivt_map(model, lons, lats, mag, iu, iv, mslp,
                                          cycle_label, fh, valid, lv)
@@ -477,10 +623,11 @@ def fetch_ivt_maps(models=None, session=None):
                 except Exception as e:
                     logging.error(f"[IVT] {model} f{fh:03d} integrate/render: {e}")
                 finally:
-                    try:
-                        os.unlink(path)
-                    except Exception:
-                        pass
+                    for _p in ([path] if isinstance(path, str) else (path or [])):
+                        try:
+                            os.unlink(_p)
+                        except Exception:
+                            pass
                 time.sleep(IVT_REQUEST_PAUSE_S)
 
             if maps:
