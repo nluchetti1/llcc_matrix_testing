@@ -197,25 +197,36 @@ def ivt_from_profile(hour_dict, **kw):
     return column_ivt(hour_dict.get("_layers") or [], **kw)
 
 
-# ---- CW3E-style colour scale --------------------------------------------------------
-# Approximates the operational CW3E IVT ramp: transparent below 250, yellow through
-# orange and red into purple at the top. Matched by eye against their published plots,
-# NOT sampled from their colour table -- close enough to read the same way side by side,
-# but do not treat it as an exact reproduction.
+# ---- CW3E colour scale --------------------------------------------------------------
+# Matched to the operational CW3E IVT plots (cw3e.ucsd.edu/ivt_iwv_namerica): 11 discrete
+# blocks, boundaries at 250/300/400/500/600/700/800/1000/1200/1400/1600, running yellow
+# through orange and red into purple at the top. Note the UNEVEN spacing -- 100-wide bins
+# up to 800, then 200-wide above it. That is theirs, not a mistake: it puts the resolution
+# in the range ordinary synoptic transport occupies and lets the AR tail share one bar.
 #
-# Note for the Space Coast: this scale is tuned for West Coast atmospheric rivers.
-# Florida IVT sits mostly in the 200-600 band, so most days render as the bottom two
-# or three bins. That is the honest picture on a CW3E-comparable scale.
-CW3E_IVT_BOUNDS = [250, 300, 350, 400, 450, 500, 550, 600, 700, 800,
-                   900, 1000, 1100, 1200, 1400, 1600, 1800]
+# Colours are matched by eye against their published plots, not sampled from their colour
+# table. Close enough to read side by side; not an exact reproduction.
+#
+# Note for the Space Coast: this scale is tuned for West Coast atmospheric rivers. Florida
+# IVT sits mostly in the 200-600 band, so most days render in the bottom two or three
+# blocks. That is the honest picture on a CW3E-comparable scale, not a rendering fault.
+CW3E_IVT_BOUNDS = [250, 300, 400, 500, 600, 700, 800, 1000, 1200, 1400, 1600]
 
-# 17 colors against 17 bounds is deliberate, not an off-by-one: BoundaryNorm with
-# extend="max" counts 16 interior bins PLUS one over-range bin, so it needs 17 colors
+# 11 colours against 11 bounds is deliberate, not an off-by-one: BoundaryNorm with
+# extend="max" counts 10 interior bins PLUS one over-range bin, so it needs 11 colours
 # or it raises "ncolors must equal or exceed the number of bins".
 CW3E_IVT_COLORS = [
-    "#ffffb2", "#fee99d", "#fed976", "#feca66", "#feb24c", "#fea346",
-    "#fd8d3c", "#fc6b32", "#fc4e2a", "#ed2f21", "#e31a1c", "#cc0f22",
-    "#b10026", "#8c0026", "#6b0026", "#4a0026", "#2d0016",
+    "#ffff00",   # 250-300    yellow
+    "#ffe600",   # 300-400
+    "#ffcc00",   # 400-500
+    "#ffa700",   # 500-600
+    "#ff8c00",   # 600-700
+    "#ff6a00",   # 700-800
+    "#ff2b00",   # 800-1000   red
+    "#d10000",   # 1000-1200
+    "#a80028",   # 1200-1400  dark red
+    "#7b1fa2",   # 1400-1600  purple
+    "#4a0072",   # >1600      dark purple
 ]
 
 
