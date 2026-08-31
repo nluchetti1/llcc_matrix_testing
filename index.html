@@ -118,6 +118,7 @@
             <a onclick="updateMetric('ct_thunder')" id="nav-ct_thunder">Cal. Thunder Map</a>
             <a onclick="showLaunchThermo()" id="nav-launch_thermo">10Z Synoptic</a>
             <a onclick="showSkewT()" id="nav-skewt" title="Skew-T soundings at KXMR by model and forecast hour">Skew-T</a>
+            <a onclick="showIvt()" id="nav-ivt" title="Integrated Vapor Transport maps by model and forecast hour">IVT Maps</a>
         </div>
         <div class="station-selector">
             <label for="stn-dropdown">Station:</label>
@@ -191,6 +192,10 @@
         let refsCumulusMaps10 = null; // {row_key: "..."} — REFS P(top>25kft) ~10nm (-20C)
         let launchThermo = null;      // {site,hour,models:[...],by_model:{model:[dayRows]}}
         let refcMaps = null;          // {row_key: "maps/refc/....png"} — NWS-scale reflectivity
+        let ivtMaps = null;           // {model: {cycle:'YYYYMMDD HHz', maps:{'f024': path}}}
+        let ivtModel = null;          // model currently shown in the IVT modal
+        let ivtIdx = 0;               // index into the sorted step list
+        let ivtTimer = null;          // animation interval handle
         let launchThermoRuns = null;  // [{timestamp, thermo}] — panel dprog/dt, current + 3 back
         let ltRunIdx = 0;             // which run the panel is currently showing
         let climoTables = null;       // {points, thompson, pwat, rh75} — monthly percentile dists
@@ -300,6 +305,7 @@
                 modelCycles = payload.model_cycles || null;   // {site: {model: 'YYYYMMDDHH'}}
                 panelCycles = payload.panel_cycles || null;   // {model: 'YYYYMMDDHH'} panel-only ensembles
                 refcMaps = payload.refc_maps || null;
+                ivtMaps = payload.ivt_maps || null;
 
                 // Diagnostic: how many hours carry a real calibrated-thunder map per window.
                 const countReal = (o) => !o ? 0 : Object.values(o).filter(Boolean).length;
@@ -3080,6 +3086,147 @@
 
         function closeSkew() { document.getElementById('skModal').style.display = 'none'; }
 
+        // ================= IVT MAP VIEWER ============================================
+        // Reads the ivt_maps block written by ivt_maps.fetch_ivt_maps(). Each model keeps
+        // its OWN init cycle: RAP runs hourly while GFS and NAM are 6-hourly, so a single
+        // shared cycle label would be wrong for at least one of them.
+
+        function ivtModels() {
+            if (!ivtMaps) return [];
+            return Object.keys(ivtMaps).filter(k => ivtMaps[k] && ivtMaps[k].maps
+                                                    && Object.keys(ivtMaps[k].maps).length);
+        }
+
+        function ivtSteps() {
+            const set = ivtMaps && ivtMaps[ivtModel];
+            if (!set || !set.maps) return [];
+            // Numeric sort on the fFFF key -- lexical order would put f100 before f024.
+            return Object.keys(set.maps)
+                .sort((a, b) => parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10));
+        }
+
+        // 'YYYYMMDD HHz' + forecast hour -> valid-time label, so the slider reads in real
+        // time instead of making the reader add the forecast hour to the init in their head.
+        function ivtValidLabel(cycle, fhKey) {
+            const m = /^(\d{4})(\d{2})(\d{2})\s+(\d{2})z$/.exec(cycle || '');
+            if (!m) return fhKey.toUpperCase();
+            const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4]));
+            d.setUTCHours(d.getUTCHours() + parseInt(fhKey.slice(1), 10));
+            const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+            return String(d.getUTCDate()).padStart(2, '0') + ' ' + MON[d.getUTCMonth()]
+                 + ' ' + String(d.getUTCHours()).padStart(2, '0') + 'Z';
+        }
+
+        function showIvt() {
+            const modal = document.getElementById('ivtModal');
+            modal.style.display = 'flex';
+            const body = document.getElementById('ivtBody');
+            const models = ivtModels();
+            if (!models.length) {
+                body.innerHTML = `<div style="padding:20px; color:#b45309;">
+                    <strong>No IVT maps in this run.</strong> The panel reads the
+                    <code>ivt_maps</code> block of <code>history.json</code>, written by
+                    <code>ivt_maps.fetch_ivt_maps()</code>. Check the pipeline log for
+                    <code>[IVT]</code> lines \u2014 a cycle that has not posted yet, or a
+                    filter error, leaves this empty.</div>`;
+                return;
+            }
+            if (!ivtModel || models.indexOf(ivtModel) === -1) { ivtModel = models[0]; ivtIdx = 0; }
+            body.innerHTML = `
+                <div style="display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-bottom:10px;">
+                    <div>
+                        <label style="font-size:0.82rem; color:#475569; margin-right:6px;">Model</label>
+                        <select id="ivt-model" onchange="ivtPickModel(this.value)"
+                                style="padding:3px 8px; border:1px solid #cbd5e1; border-radius:6px;">
+                            ${models.map(m => `<option value="${m}"${m === ivtModel ? ' selected' : ''}>`
+                                            + `${m.toUpperCase()}</option>`).join('')}
+                        </select>
+                    </div>
+                    <span id="ivt-cycle" style="font-size:0.8rem; color:#94a3b8;"></span>
+                    <span id="ivt-time" style="font-size:0.86rem; font-weight:700; color:#1e3a5f; margin-left:auto;"></span>
+                </div>
+                <input type="range" id="ivt-slider" min="0" max="0" value="0" step="1"
+                       oninput="ivtSetFrame(this.value)" style="width:100%;">
+                <div style="display:flex; gap:8px; justify-content:center; margin:8px 0;">
+                    <button class="dprog-btn" onclick="ivtStep(-1)">&laquo; Prev</button>
+                    <button class="dprog-btn" onclick="ivtTogglePlay()" id="ivt-play-btn">&#9654; Play</button>
+                    <button class="dprog-btn" onclick="ivtStep(1)">Next &raquo;</button>
+                </div>
+                <div style="text-align:center;">
+                    <img id="ivt-img" alt="IVT forecast map"
+                         style="max-width:100%; border:1px solid #cbd5e1; border-radius:4px; background:#fff;">
+                </div>
+                <div style="font-size:0.74rem; color:#94a3b8; margin-top:10px;">
+                    Vertically integrated water vapour transport, surface\u2013300 hPa, on the
+                    CW3E colour scale. Arrows show the direction the vapour is MOVING, which is
+                    the opposite sense to the FROM directions used elsewhere on this page.
+                    Contours are MSLP at 4 hPa. Florida normally sits in the bottom two or three
+                    colour blocks \u2014 this scale is built for West Coast atmospheric rivers.
+                </div>`;
+            ivtSyncSlider();
+            ivtRender();
+        }
+
+        function closeIvt() {
+            // Stop the animation on close, or it keeps firing against a hidden modal and
+            // the next open starts mid-loop.
+            if (ivtTimer) { clearInterval(ivtTimer); ivtTimer = null; }
+            document.getElementById('ivtModal').style.display = 'none';
+        }
+
+        function ivtSyncSlider() {
+            const s = document.getElementById('ivt-slider');
+            if (!s) return;
+            const n = ivtSteps().length;
+            s.min = 0;
+            s.max = Math.max(0, n - 1);
+            if (ivtIdx > n - 1) ivtIdx = 0;
+            s.value = ivtIdx;
+        }
+
+        function ivtPickModel(m) { ivtModel = m; ivtIdx = 0; ivtSyncSlider(); ivtRender(); }
+        function ivtSetFrame(v) { ivtIdx = parseInt(v, 10) || 0; ivtRender(); }
+
+        function ivtStep(d) {
+            const n = ivtSteps().length;
+            if (!n) return;
+            ivtIdx = (ivtIdx + d + n) % n;          // wraps, so Play loops
+            const s = document.getElementById('ivt-slider');
+            if (s) s.value = ivtIdx;
+            ivtRender();
+        }
+
+        function ivtTogglePlay() {
+            const btn = document.getElementById('ivt-play-btn');
+            if (ivtTimer) {
+                clearInterval(ivtTimer); ivtTimer = null;
+                btn.innerHTML = '&#9654; Play';
+                return;
+            }
+            ivtTimer = setInterval(() => ivtStep(1), 700);
+            btn.innerHTML = '&#10074;&#10074; Pause';
+        }
+
+        function ivtRender() {
+            const set = ivtMaps && ivtMaps[ivtModel];
+            if (!set) return;
+            const steps = ivtSteps();
+            if (!steps.length) return;
+            const key = steps[Math.min(ivtIdx, steps.length - 1)];
+            // One cache-buster per page load, not per frame. Filenames carry the cycle so
+            // they are stable within a run, but a NEW run reuses names for a new cycle and
+            // the browser would otherwise serve the previous run's PNG from cache.
+            if (!window.__ivtBust) window.__ivtBust = Date.now();
+            const img = document.getElementById('ivt-img');
+            if (img) img.src = set.maps[key] + '?t=' + window.__ivtBust;
+            const t = document.getElementById('ivt-time');
+            if (t) t.innerText = key.toUpperCase() + ' \u00b7 valid '
+                               + ivtValidLabel(set.cycle, key);
+            const c = document.getElementById('ivt-cycle');
+            if (c) c.innerText = set.cycle ? 'init ' + set.cycle + ' \u00b7 '
+                                          + steps.length + ' steps' : '';
+        }
+
         // ---- keyboard navigation ---------------------------------------------------------
         // Left/Right step the forecast hour, Home/End jump to the ends, Escape closes.
         //
@@ -3153,6 +3300,18 @@
         </div>
         <div id="bpBody" style="padding:14px 18px 18px;"></div>
       </div>
+    </div>
+    <div id="ivtModal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.55);
+         align-items:flex-start; justify-content:center; z-index:920; padding:24px 14px; overflow:auto;">
+        <div style="background:#fff; border-radius:10px; max-width:1100px; width:98%; padding:16px 20px;
+             box-shadow:0 10px 40px rgba(0,0,0,0.3);">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                <strong style="font-size:1.02rem;">Integrated Vapor Transport</strong>
+                <button onclick="closeIvt()" style="border:1px solid #cbd5e1; background:#f8fafc;
+                        border-radius:6px; padding:3px 10px; cursor:pointer;">&times;</button>
+            </div>
+            <div id="ivtBody"></div>
+        </div>
     </div>
     <div id="skModal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.55);
          align-items:flex-start; justify-content:center; z-index:920; padding:24px 14px; overflow:auto;">
