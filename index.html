@@ -1572,6 +1572,7 @@
             ti:   { watch: 5,    split: 10,   unit: '',     dp: 1 },
             rh:   { watch: 10,   split: 20,   unit: '%',    dp: 0 },
             pwat: { watch: 0.25, split: 0.50, unit: ' in',  dp: 2 },
+            ivt:  { watch: 75,   split: 150,  unit: '',     dp: 0 },
             ltg:  { watch: 15,   split: 30,   unit: '%',    dp: 0 },
             spd:  { watch: 8,    split: 15,   unit: ' kt',  dp: 0 },
             dir:  { watch: 40,   split: 80,   unit: '\u00b0', dp: 0 },
@@ -1581,6 +1582,17 @@
             if (a == null || b == null) return null;
             return ((a - b + 540) % 360) - 180;
         }
+        // IVT cell: magnitude over transport direction, stacked. Direction is the way the
+        // vapour is MOVING (CW3E vector convention), which is the opposite sense to every
+        // other wind field on this page -- hence the explicit arrow rather than a bare
+        // bearing that would be read as a FROM direction.
+        function ltIvtTxt(r) {
+            if (!r || r.ivt == null) return '<span style="color:#cbd5e1;">\u2014</span>';
+            const dir = (r.ivt_dir == null) ? '' :
+                `<div style="color:#94a3b8; font-weight:400; font-size:0.76rem;">\u2192 ${String(r.ivt_dir).padStart(3, '0')}\u00b0</div>`;
+            return `<span style="font-weight:600;">${Math.round(r.ivt)}</span>${dir}`;
+        }
+
         function ltDeltaChip(d, tolKey, showSign) {
             const t = LT_CMP_TOL[tolKey];
             if (d == null || !t) return '<span style="color:#cbd5e1;">\u2014</span>';
@@ -1677,11 +1689,12 @@
                     style="padding:8px 6px; cursor:pointer; text-decoration:underline dotted;">700\u2013500 mb RH</th>
                 <th onclick="showBoxPlot('pwat')" title="Click for the monthly climatology box plot"
                     style="padding:8px 6px; cursor:pointer; text-decoration:underline dotted;">PWAT (in)</th>
+                <th style="padding:8px 6px;" title="Integrated Vapor Transport, surface\u2013300 hPa">IVT</th>
                 <th style="padding:8px 6px;">Cizek Lightning</th>
               </tr></thead><tbody>`;
 
             if (!joined.length) {
-                html += `<tr><td colspan="9" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for either model this run.</td></tr>`;
+                html += `<tr><td colspan="10" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for either model this run.</td></tr>`;
             } else {
                 for (const j of joined) {
                     const a = j[S1.key] || null, b = j[S2.key] || null;
@@ -1689,6 +1702,7 @@
                     const dTi   = (a && b && a.ti != null && b.ti != null) ? a.ti - b.ti : null;
                     const dRh   = (a && b && a.ltg_rh != null && b.ltg_rh != null) ? a.ltg_rh - b.ltg_rh : null;
                     const dPw   = (a && b && a.pwat != null && b.pwat != null) ? a.pwat - b.pwat : null;
+                    const dIvt  = (a && b && a.ivt != null && b.ivt != null) ? a.ivt - b.ivt : null;
                     const dLtg  = (a && b && a.ltg != null && b.ltg != null) ? a.ltg - b.ltg : null;
                     const dMfD  = (a && b) ? ltAngDiff(a.mf_dir, b.mf_dir) : null;
                     const dMfS  = (a && b && a.mf_spd != null && b.mf_spd != null) ? a.mf_spd - b.mf_spd : null;
@@ -1718,6 +1732,7 @@
                       ${clk('thompson', j, a && a.ti, a && a.ti_pct, b && b.ti, b && b.ti_pct, numTxt(a && a.ti, 1) + pct(a && a.ti_pct))}
                       ${clk('rh75', j, a && a.ltg_rh, a && a.rh_pct, b && b.ltg_rh, b && b.rh_pct, numTxt(a && a.ltg_rh, 0, '%') + pct(a && a.rh_pct))}
                       ${clk('pwat', j, a && a.pwat, a && a.pwat_pct, b && b.pwat, b && b.pwat_pct, numTxt(a && a.pwat, 2) + pct(a && a.pwat_pct))}
+                      <td style="padding:6px;">${ltIvtTxt(a)}</td>
                       <td style="padding:6px;">${a && a.ltg != null ? a.ltg + '%' : '\u2014'}</td>
                     </tr>`;
 
@@ -1730,6 +1745,7 @@
                       ${clk('thompson', j, a && a.ti, a && a.ti_pct, b && b.ti, b && b.ti_pct, numTxt(b && b.ti, 1) + pct(b && b.ti_pct))}
                       ${clk('rh75', j, a && a.ltg_rh, a && a.rh_pct, b && b.ltg_rh, b && b.rh_pct, numTxt(b && b.ltg_rh, 0, '%') + pct(b && b.rh_pct))}
                       ${clk('pwat', j, a && a.pwat, a && a.pwat_pct, b && b.pwat, b && b.pwat_pct, numTxt(b && b.pwat, 2) + pct(b && b.pwat_pct))}
+                      <td style="padding:6px;">${ltIvtTxt(b)}</td>
                       <td style="padding:6px;">${b && b.ltg != null ? b.ltg + '%' : '\u2014'}</td>
                     </tr>`;
 
@@ -1743,6 +1759,7 @@
                       <td style="padding:6px;">${ltDeltaChip(dTi, 'ti')}</td>
                       <td style="padding:6px;">${ltDeltaChip(dRh, 'rh')}</td>
                       <td style="padding:6px;">${ltDeltaChip(dPw, 'pwat')}</td>
+                      <td style="padding:6px;">${ltDeltaChip(dIvt, 'ivt')}</td>
                       <td style="padding:6px;">${ltDeltaChip(dLtg, 'ltg')}</td>
                     </tr>`;
                 }
@@ -1857,10 +1874,11 @@
                     style="padding:8px 6px; cursor:pointer; text-decoration:underline dotted;">700–500 mb RH</th>
                 <th onclick="showBoxPlot('pwat')" title="Click for the monthly climatology box plot"
                     style="padding:8px 6px; cursor:pointer; text-decoration:underline dotted;">PWAT (in)</th>
+                <th style="padding:8px 6px;" title="Integrated Vapor Transport, surface\u2013300 hPa">IVT</th>
                 <th style="padding:8px 6px;">Cizek Lightning Probability</th>
               </tr></thead><tbody>`;
             if (!rows.length) {
-                html += `<tr><td colspan="8" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for ${model.toUpperCase()} this run.</td></tr>`;
+                html += `<tr><td colspan="9" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for ${model.toUpperCase()} this run.</td></tr>`;
             } else {
                 for (const r of rows) {
                     html += `<tr style="border-bottom:1px solid #f1f5f9;">
@@ -1871,6 +1889,7 @@
                       ${clickCell('thompson', r, r.ti, r.ti_pct, `${num(r.ti)} <span style="color:#cbd5e1;">|</span> ${pct(r.ti_pct)}`)}
                       ${clickCell('rh75', r, r.ltg_rh, r.rh_pct, rhCell(r))}
                       ${clickCell('pwat', r, r.pwat, r.pwat_pct, `${num(r.pwat)} <span style="color:#cbd5e1;">|</span> ${pct(r.pwat_pct)}`)}
+                      <td style="padding:8px 6px;">${ltIvtTxt(r)}</td>
                       <td style="padding:8px 6px;">${ltgCell(r)}</td>
                     </tr>`;
                 }
@@ -2732,6 +2751,10 @@
             { k: 'lifted_index', lab: 'Lifted Index', unit: '', dp: 1, watch: 2, split: 4 },
             { k: 'thompson', lab: 'Thompson', unit: '', dp: 1, watch: 5, split: 10 },
             { k: 'pwat_in', lab: 'PWAT', unit: ' in', dp: 2, watch: 0.25, split: 0.5 },
+            // IVT spread thresholds are absolute, not fractional: 75 kg/m/s is a real
+            // difference on a 300 day and noise on a 1500 day, but the launch-relevant
+            // question is the absolute moisture flux, so absolute is the right scale.
+            { k: 'ivt', lab: 'IVT', unit: ' kg/m/s', dp: 0, watch: 75, split: 150 },
             { k: 'rh_700_500', lab: '700\u2013500 RH', unit: '%', dp: 0, watch: 10, split: 20 },
             // Spread thresholds are wider than they look: the forest is a step function, so
             // two models 3 Thompson apart can land 20 percentage points apart with no real
