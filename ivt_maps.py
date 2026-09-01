@@ -79,7 +79,11 @@ IVT_MODELS = {
         "mslp": "PRMSL",
         "cycles": [0, 6, 12, 18],
         "latency_h": 4,
-        "steps": list(range(0, 181, 6)),   # f000-f180 6-hourly, matching CW3E
+        # Tapered: 3-hourly through f072 where the field actually evolves, 6-hourly beyond.
+        # GFS publishes 1-hourly to f120 so 3-hourly everywhere is available -- but that is 61
+        # NOMADS requests instead of 31, and GFS was being refused by NOMADS two runs ago.
+        # Tapering buys the short-range detail without doubling throttle exposure.
+        "steps": list(range(0, 73, 3)) + list(range(78, 181, 6)),
     },
     "rap": {
         "enabled": True,
@@ -94,7 +98,9 @@ IVT_MODELS = {
         "mslp": "MSLMA",
         "cycles": list(range(24)),
         "latency_h": 2,
-        "steps": list(range(0, 22, 3)),
+        # RAP is an HOURLY model and only runs to f021, so sampling every third hour threw
+        # away most of what it offers for 14 extra cheap requests.
+        "steps": list(range(0, 22, 1)),
     },
     "nam": {
         "enabled": True,
@@ -106,7 +112,8 @@ IVT_MODELS = {
         "mslp": "PRMSL",
         "cycles": [0, 6, 12, 18],
         "latency_h": 3,
-        "steps": list(range(0, 85, 6)),
+        # NAM carries 3-hourly all the way to f084, so the full range is available.
+        "steps": list(range(0, 85, 3)),
     },
     # ECMWF is NOT a NOMADS model and behaves differently in three ways that matter:
     #   * no spatial subsetting -- every step arrives as a full global 721x1440 grid, so it
@@ -125,6 +132,11 @@ IVT_MODELS = {
         # would silently truncate the map set. determine_cycle snaps back to 00/12.
         "cycles": [0, 12],
         "latency_h": 8,
+        # Left at 6-hourly ON PURPOSE. ECMWF has 3-hourly to f144, but at 16.8 MB/step that
+        # is 49 steps and ~820 MB per run -- roughly double everything else combined, on a
+        # pipeline already running 43 minutes against an hourly cron. For 3-hourly ECMWF over
+        # a shorter range, use:
+        #     list(range(0, 73, 3)) + list(range(78, 145, 6))
         "steps": list(range(0, 145, 6)),
     },
 }
@@ -135,8 +147,8 @@ IVT_REQUEST_PAUSE_S = 4.0
 IVT_CONNECT_TIMEOUT = 15
 IVT_READ_TIMEOUT = 90
 IVT_ATTEMPTS = 3
-IVT_BUDGET_S = 900          # whole-job budget; returns what it has when spent
-IVT_MODEL_BUDGET_S = 420    # per-model cap, so a slow ECMWF cannot starve GFS
+IVT_BUDGET_S = 1500         # whole-job budget; returns what it has when spent
+IVT_MODEL_BUDGET_S = 480    # per-model cap, so a slow ECMWF cannot starve GFS
 IVT_THROTTLE_BACKOFF_S = 20 # 403/429/503 means NOMADS is declining; retrying in 4s
                             # just burns the budget being refused more quickly
 IVT_CYCLE_ATTEMPTS = 2      # probe tries per candidate cycle before walking back
