@@ -3238,7 +3238,10 @@
         // committing several MB per model per run into git -- on an hourly cron that is
         // hundreds of MB a day of history for a file nobody may ever open. Doing it on
         // demand costs the repo nothing and the pipeline no time.
-        const IVT_GIF_MAX_W = 900;        // downscale cap; full frames are ~920px
+        // 700, not 900. The step lists went 3-hourly, so GFS is now 43 frames: at 900px
+        // that is ~107 MB of ImageData held at once, which Safari on a phone will kill.
+        // 700px brings the same 43 frames down to ~67 MB. Raise it for desktop-only use.
+        const IVT_GIF_MAX_W = 700;        // downscale cap; full frames are ~920px
         const IVT_GIF_DELAY_MS = 450;     // per-frame hold
         const IVT_GIF_MAX_FRAMES = 60;    // above this, frames are subsampled
         const IVT_GIF_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/';
