@@ -2069,9 +2069,25 @@ def compute_profile_variables(profile_layers):
             thick_layer_violated = True
             thickest_in_band_ft = max(thickest_in_band_ft, in_band_depth if in_band_depth > 0 else depth)
 
+    # Mixed-layer depth AGL, plus the strength of the capping theta jump. Both are already
+    # computed above for the momentum calculation and were being discarded; the cool-season
+    # panel needs them as a TIME SERIES to say when the nocturnal inversion breaks, which is
+    # the single most useful thing a 10Z sounding can tell you about a Florida winter day.
+    #
+    # AGL, not MSL: the clamp above is expressed relative to the surface, and a depth is what
+    # every downstream consumer wants. Note the floor -- MIN_ML_TOP_FT means a strongly capped
+    # nocturnal profile reports exactly 1000 ft rather than something smaller, so treat 1000
+    # as "capped", not as a measurement.
+    _ml_agl = max(0.0, ml_top_ft - sfc_hght)
+    _cap_layer = next((l for l in profile_layers if l["hght"] >= ml_top_ft), None)
+    _cap_dtheta = (round(_theta_k(_cap_layer) - sfc_theta, 1)
+                   if _cap_layer is not None else None)
+
     return {
         "mom_mean": round(mean_wind, 1),
         "mom_max": round(max_pbl, 1),
+        "ml_top_agl": round(_ml_agl),
+        "cap_dtheta": _cap_dtheta,
         "shear": calc_shear_0_6km(),
         "vis": vis,
         "ceiling": ceiling_val,
@@ -5400,6 +5416,151 @@ def _row_sort_key(rk):
     except Exception:
         return (999, 999)
 
+# ---- Cool-season panel ----------------------------------------------------------------
+# The warm-season panel answers "will it be convective?" -- Thompson, PWAT, the Cizek forest.
+# From roughly November through March at the Cape those are the wrong questions: deep
+# convection is rare, and the constraints that actually scrub are the Thick Cloud Layer rule
+# on frontal stratiform decks, low stratocumulus behind a front, and surface winds driven by
+# momentum mixed down once the nocturnal inversion breaks. This panel answers those instead.
+#
+# IT IS A DAY AGGREGATE, NOT A SNAPSHOT. The warm panel takes the profile nearest 10Z and
+# reports it. Every quantity here except the airmass anchors is computed across ALL of that
+# forecast day's hours, because "when does it mix out" and "how long is the ceiling down"
+# are questions about a diurnal cycle, not about one sounding. The 10Z sounding is still the
+# anchor -- it is the observed initialization and it sets the isotherm band -- but the panel
+# is allowed to look forward through the day from there.
+
+MIXING_BREAK_FT = 3000.0   # mixed-layer depth that counts as "inversion broken, deeply mixing"
+LOW_CEILING_FT = 3000.0    # ceiling at or below this counts as a low-cloud (stratocu) hour
+
+# Hours of the UTC day to aggregate over. A UTC day at the Cape runs from ~7 pm EST the
+# previous evening, so 00-23Z captures one full local diurnal cycle: the nocturnal inversion
+# forms early in the window, breaks around 13-15Z, and mixing peaks near 19-20Z. Grouping on
+# the UTC day is therefore the natural window here, not an approximation to apologise for.
+COOL_DAY_HOURS = range(0, 24)
+
+
+def _cool_season_day(profiles, anchor):
+    """Aggregate one forecast day's hourly profiles into a single cool-season row.
+
+    `profiles` is [(hh, prof_dict)] for one UTC day, `anchor` the profile nearest 10Z.
+    Returns the metrics dict, or None when the day carries nothing usable.
+    """
+    ml, mom_mean, mom_max, ceils, thick = [], [], [], [], []
+    for hh, p in profiles:
+        if p.get("ml_top_agl") is not None:
+            ml.append((hh, float(p["ml_top_agl"])))
+        if p.get("mom_mean") is not None:
+            mom_mean.append(float(p["mom_mean"]))
+        if p.get("mom_max") is not None:
+            mom_max.append((hh, float(p["mom_max"])))
+        if p.get("ceiling") is not None:
+            ceils.append((hh, float(p["ceiling"])))
+        if p.get("thick_layer"):
+            thick.append((hh, float(p.get("thick_layer_ft") or 0.0)))
+    if not (ml or mom_max or ceils):
+        return None
+
+    # Inversion break: the FIRST hour the mixed layer gets deeper than MIXING_BREAK_FT.
+    # Deliberately a threshold crossing rather than a rate of change -- the profiles are
+    # hourly at best and 3-hourly for several models, so a derivative would mostly measure
+    # the sampling interval. None means the layer never got there, which on a Florida winter
+    # day is itself the forecast: capped all day, momentum stays aloft, surface stays light.
+    brk = next((hh for hh, v in sorted(ml) if v >= MIXING_BREAK_FT), None)
+    ml_peak = max(ml, key=lambda t: t[1]) if ml else None
+    mom_peak = max(mom_max, key=lambda t: t[1]) if mom_max else None
+    ceil_low = min(ceils, key=lambda t: t[1]) if ceils else None
+
+    return {
+        # Mixing
+        "ml_10z": (None if not anchor or anchor.get("ml_top_agl") is None
+                   else round(float(anchor["ml_top_agl"]))),
+        "cap_dtheta": (anchor or {}).get("cap_dtheta"),
+        "ml_max": None if not ml_peak else round(ml_peak[1]),
+        "ml_max_hh": None if not ml_peak else ml_peak[0],
+        "brk_hh": brk,
+        # Momentum transfer
+        "mom_mean": round(sum(mom_mean) / len(mom_mean), 1) if mom_mean else None,
+        "mom_max": None if not mom_peak else round(mom_peak[1], 1),
+        "mom_max_hh": None if not mom_peak else mom_peak[0],
+        # Thick Cloud Layer LLCC
+        "thick_hrs": len(thick),
+        "thick_max_ft": round(max((v for _, v in thick), default=0.0)),
+        "thick_first_hh": min((hh for hh, _ in thick), default=None),
+        # Low cloud / stratocumulus
+        "ceil_min": None if not ceil_low else round(ceil_low[1]),
+        "ceil_min_hh": None if not ceil_low else ceil_low[0],
+        "low_hrs": sum(1 for _, v in ceils if v <= LOW_CEILING_FT),
+        # Sampling honesty: RAP and HRRR only reach ~18-21 h, so their later days are
+        # partial and their "day max" is a max over whatever hours existed.
+        "n_hours": len(profiles),
+    }
+
+
+def build_cool_season_thermo(combined_data, site="kxmr", assess_hour=10):
+    """Cool-season companion to build_launch_thermo. Same {model: [day rows]} shape.
+
+    Shares the warm panel's day/anchor selection so the two tables line up row for row --
+    same forecast days, same order, same engine labels -- and a user toggling between them
+    is comparing like with like rather than re-reading the axis.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    site_models = combined_data.get(site, {}) or {}
+    by_model = {}
+    for model, rows in site_models.items():
+        if not isinstance(rows, dict):
+            continue
+        if model == "refs" and not REFS_MEAN_IN_PANEL:
+            continue
+        days = {}
+        for row_key, prof in rows.items():
+            if not isinstance(prof, dict):
+                continue
+            try:
+                dd, hh = map(int, row_key.split("/"))
+            except Exception:
+                continue
+            if hh in COOL_DAY_HOURS:
+                days.setdefault(dd, []).append((hh, prof))
+        day_rows = []
+        for dd, profiles in days.items():
+            profiles.sort()
+            # Anchor on the profile nearest the assessment hour, matching the warm panel's
+            # tolerance so the two agree on which sounding "is" 10Z for a given day.
+            cands = [(abs(hh - assess_hour), hh, p) for hh, p in profiles
+                     if abs(hh - assess_hour) <= ASSESS_HOUR_TOL]
+            cands.sort(key=lambda c: (c[0], c[1]))
+            anchor = cands[0][2] if cands else None
+            metrics = _cool_season_day(profiles, anchor)
+            if not metrics:
+                continue
+            day_label, date_str, sort_key, month, _yr = _valid_day_fields(dd, now)
+            a = anchor or {}
+            th = compute_launch_thermo(a.get("_layers")) if a.get("_layers") else None
+            row = {
+                "day": day_label, "date": date_str, "sort": sort_key, "month": month,
+                "vhh": cands[0][1] if cands else None,
+                # Airmass anchors, read off the 10Z sounding rather than the day.
+                "h0c": a.get("hght_0c"), "h20c": a.get("hght_20c"),
+                "av_dir": a.get("av_dir"), "av_spd": a.get("av_spd"),
+                "mf_dir": (th or {}).get("mf_dir"), "mf_spd": (th or {}).get("mf_spd"),
+                "regime": (th or {}).get("mf_regime"),
+                "engine": (th or {}).get("engine"),
+            }
+            row.update(metrics)
+            day_rows.append(row)
+        if day_rows:
+            day_rows.sort(key=lambda r: r["sort"])
+            by_model[model] = day_rows
+
+    # Same preference order the warm panel uses, so toggling between the two never reshuffles
+    # the model selector underneath the user.
+    pref = ["gfs", "ecmwf", "gefs", "ecens", "rrfs", "refs", "rap", "hrrr"]
+    models = sorted(by_model.keys(), key=lambda m: (pref.index(m) if m in pref else 99, m))
+    return {"site": site.upper(), "hour": assess_hour, "models": models, "by_model": by_model,
+            "mixing_break_ft": MIXING_BREAK_FT, "low_ceiling_ft": LOW_CEILING_FT}
+
+
 def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_rows=None,
                         gefs_member_rows=None, ecens_member_rows=None):
     """Assemble the launch-thermo panel: for each model that has a KXMR sounding, one row per
@@ -5621,12 +5782,17 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     # maps and nothing else, which is why it gets its own try and returns {} rather than
     # raising. GFS is the only enabled model by default -- see ivt_maps.py for why RAP/NAM
     # are optional and HRRR/GEFS are excluded outright.
+    # IVT maps moved to their own workflow (run_ivt.yml). They added ~11 minutes to a run
+    # that was already at 43, which pushed scheduled runs past timeout-minutes: 60 and got
+    # them cancelled with no error text. Set IVT_IN_PIPELINE=1 to fold them back in.
     ivt_map_set = {}
-    if ivt_maps.IVT_MAPS_ENABLED:
+    if os.environ.get("IVT_IN_PIPELINE") == "1" and ivt_maps.IVT_MAPS_ENABLED:
         try:
             ivt_map_set = ivt_maps.fetch_ivt_maps()
         except Exception as e:
             logging.error(f"[IVT] map set failed, continuing without it: {e}")
+    else:
+        logging.info("[IVT] maps skipped here; run_ivt.yml owns them (IVT_IN_PIPELINE=1 to re-enable)")
 
     refc_maps = {}   # {row_key: "maps/refc/....png"} — backs the ANVIL hover popup
     if CONVECTIVE_MASK_ENABLED:
@@ -5825,9 +5991,24 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
                                             ecens_member_rows=ecens_member_rows)
         logging.info(f"Launch thermo: {len(launch_thermo['models'])} models, "
                      f"rows/model={ {m: len(launch_thermo['by_model'][m]) for m in launch_thermo['models']} }")
+        # Cool-season companion, carried INSIDE launch_thermo rather than as its own payload
+        # key. thermo_runs stores the whole launch_thermo dict, so nesting it here gives the
+        # cool panel dprog/dt across runs for free instead of duplicating that plumbing.
+        # Its own try/except: a cool-panel failure must not cost the warm panel, which is the
+        # one people look at for eight months of the year.
+        try:
+            launch_thermo["cool"] = build_cool_season_thermo(combined_data, site="kxmr",
+                                                             assess_hour=10)
+            _c = launch_thermo["cool"]
+            logging.info(f"Cool-season thermo: {len(_c['models'])} models, "
+                         f"rows/model={ {m: len(_c['by_model'][m]) for m in _c['models']} }")
+        except Exception as e:
+            logging.error(f"Cool-season thermo build failed (warm panel unaffected): {e}")
+            launch_thermo["cool"] = {"site": "KXMR", "hour": 10, "models": [], "by_model": {}}
     except Exception as e:
         logging.error(f"Launch thermo build failed: {e}")
-        launch_thermo = {"site": "KXMR", "hour": 10, "models": [], "by_model": {}}
+        launch_thermo = {"site": "KXMR", "hour": 10, "models": [], "by_model": {},
+                         "cool": {"site": "KXMR", "hour": 10, "models": [], "by_model": {}}}
 
     # Skew-T export MUST happen here: it reuses the very `_layers` the next block deletes.
     try:
