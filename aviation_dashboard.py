@@ -2069,25 +2069,21 @@ def compute_profile_variables(profile_layers):
             thick_layer_violated = True
             thickest_in_band_ft = max(thickest_in_band_ft, in_band_depth if in_band_depth > 0 else depth)
 
-    # Mixed-layer depth AGL, plus the strength of the capping theta jump. Both are already
-    # computed above for the momentum calculation and were being discarded; the cool-season
-    # panel needs them as a TIME SERIES to say when the nocturnal inversion breaks, which is
-    # the single most useful thing a 10Z sounding can tell you about a Florida winter day.
+    # Mixed-layer depth AGL. Already diagnosed above for the momentum calculation and
+    # previously discarded; the cool-season panel needs it as a TIME SERIES to say when the
+    # nocturnal inversion breaks, which is the single most useful thing a 10Z sounding can
+    # tell you about a Florida winter day.
     #
     # AGL, not MSL: the clamp above is expressed relative to the surface, and a depth is what
     # every downstream consumer wants. Note the floor -- MIN_ML_TOP_FT means a strongly capped
     # nocturnal profile reports exactly 1000 ft rather than something smaller, so treat 1000
     # as "capped", not as a measurement.
     _ml_agl = max(0.0, ml_top_ft - sfc_hght)
-    _cap_layer = next((l for l in profile_layers if l["hght"] >= ml_top_ft), None)
-    _cap_dtheta = (round(_theta_k(_cap_layer) - sfc_theta, 1)
-                   if _cap_layer is not None else None)
 
     return {
         "mom_mean": round(mean_wind, 1),
         "mom_max": round(max_pbl, 1),
         "ml_top_agl": round(_ml_agl),
-        "cap_dtheta": _cap_dtheta,
         "shear": calc_shear_0_6km(),
         "vis": vis,
         "ceiling": ceiling_val,
@@ -5494,7 +5490,6 @@ def _cool_season_day(profiles, anchor):
         # Mixing
         "ml_10z": (None if not anchor or anchor.get("ml_top_agl") is None
                    else round(float(anchor["ml_top_agl"]))),
-        "cap_dtheta": (anchor or {}).get("cap_dtheta"),
         "ml_max": None if not ml_peak else round(ml_peak[1]),
         "ml_max_hh": None if not ml_peak else ml_peak[0],
         "brk_hh": brk,
