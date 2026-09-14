@@ -1331,6 +1331,10 @@
         // the point of the panel: "when does it mix out" and "how long is the ceiling down" are
         // questions about a diurnal cycle. The 10Z sounding anchors the airmass and sets the
         // isotherm band; the rest looks forward through that forecast day.
+        // Secondary line under a cell's headline value. Was 0.7rem/#64748b, which was both too
+        // pale to read at a glance and long enough to overflow a narrow column and collide with
+        // the next one. Bigger, darker, and allowed to wrap inside its own cell.
+        const CT_SUB = 'font-size:0.76rem; color:#475569; margin-top:3px; line-height:1.35; white-space:normal; overflow-wrap:anywhere;';
         function ctHH(h) {
             return (h == null) ? '<span style="color:#94a3b8;">\u2014</span>'
                                : String(h).padStart(2, '0') + 'Z';
@@ -1375,7 +1379,7 @@
             html += `<table style="width:100%; border-collapse:collapse; font-size:0.86rem;">
               <thead><tr style="background:#f1f5f9; text-align:left;">
                 <th style="padding:8px 6px;">Day</th>
-                <th style="padding:8px 6px;" title="Mixed-layer depth AGL at 10Z, the day's peak, and the hour the layer first exceeds ${brkFt.toLocaleString()} ft">Mixing (10Z \u2192 max)</th>
+                <th style="padding:8px 6px; white-space:nowrap;" title="Mixed-layer depth AGL at 10Z, the day's peak, and the hour of that peak">Mixing&nbsp;(10Z\u2192max)</th>
                 <th style="padding:8px 6px;" title="Inversion break: first hour the mixed layer exceeds ${brkFt.toLocaleString()} ft AGL">Inversion break</th>
                 <th style="padding:8px 6px;" title="Day-mean of the hourly mixed-layer mean wind">PBL Mom Mean</th>
                 <th style="padding:8px 6px;" title="Day peak of the hourly mixed-layer max wind, and the hour it occurs">PBL Mom Max</th>
@@ -1392,45 +1396,59 @@
                 const bg = i % 2 ? '#ffffff' : '#f8fafc';
                 // A day the inversion never breaks is a forecast, not a gap: momentum stays
                 // aloft and the surface stays light. Say that rather than showing a dash.
+                // "capped" and "nearly broke" are different forecasts. A day that peaked just
+                // under the threshold gets its own chip rather than being flattened into capped.
                 const brk = (r.brk_hh == null)
-                    ? ctChip('capped', '#e0e7ff', '#3730a3')
+                    ? (r.brk_near
+                        ? ctChip('near', '#fde68a', '#78350f') +
+                          `<div style="${CT_SUB}">peaked just under ${brkFt.toLocaleString()} ft</div>`
+                        : ctChip('capped', '#e0e7ff', '#3730a3'))
                     : ctChip(ctHH(r.brk_hh).replace(/<[^>]*>/g, ''), '#dcfce7', '#166534');
                 const thick = r.thick_hrs
                     ? ctChip(`${r.thick_hrs} hr${r.thick_hrs === 1 ? '' : 's'}`, '#fecaca', '#7f1d1d') +
-                      `<div style="font-size:0.7rem; color:#64748b; margin-top:2px;">max ${ctNum(r.thick_max_ft)} ft in band &middot; from ${ctHH(r.thick_first_hh)}</div>`
+                      `<div style="${CT_SUB}">from ${ctHH(r.thick_first_hh)}<br>max ${ctNum(r.thick_max_ft)} ft</div>`
                     : '<span style="color:#94a3b8;">none</span>';
+                const noCeil = cool.no_ceiling_ft || 24000;
                 const low = (r.ceil_min == null) ? '<span style="color:#94a3b8;">\u2014</span>'
-                    : `${r.ceil_min <= lowFt ? ctChip(ctNum(r.ceil_min) + ' ft', '#fef3c7', '#78350f') : ctNum(r.ceil_min) + ' ft'}
-                       <div style="font-size:0.7rem; color:#64748b; margin-top:2px;">min at ${ctHH(r.ceil_min_hh)} &middot; ${r.low_hrs} hr\u2264${lowFt.toLocaleString()} ft</div>`;
+                    : (r.ceil_min >= noCeil
+                        // Sentinel, not a measurement: no deck qualified as a ceiling all day.
+                        ? `<span style="color:#0f766e; font-weight:600;">no ceiling</span>
+                           <div style="${CT_SUB}">clear all day</div>`
+                        : `${r.ceil_min <= lowFt ? ctChip(ctNum(r.ceil_min) + ' ft', '#fef3c7', '#78350f') : ctNum(r.ceil_min) + ' ft'}
+                           <div style="${CT_SUB}">min at ${ctHH(r.ceil_min_hh)}<br>${r.low_hrs} hr${r.low_hrs === 1 ? '' : 's'} \u2264 ${lowFt.toLocaleString()} ft</div>`);
                 // n_hours is on the row because RAP and HRRR only reach ~18-21 h: their later
                 // days are partial, and a "day max" over 3 hours is not the same claim.
                 const partial = (r.n_hours != null && r.n_hours < 6)
-                    ? `<div style="font-size:0.68rem; color:#b45309; margin-top:2px;">partial day (${r.n_hours} hr)</div>` : '';
+                    ? `<div style="font-size:0.74rem; color:#b45309; margin-top:3px; font-weight:600;">partial day (${r.n_hours} hr)</div>` : '';
                 html += `<tr style="background:${bg}; border-bottom:1px solid #e2e8f0;">
-                  <td style="padding:8px 6px; font-weight:600; white-space:nowrap;">${r.day}
-                      <div style="font-size:0.7rem; color:#64748b; font-weight:400;">${r.date}</div>${partial}</td>
-                  <td style="padding:8px 6px;">${ctNum(r.ml_10z)} \u2192 <strong>${ctNum(r.ml_max)}</strong> ft
-                      <div style="font-size:0.7rem; color:#64748b;">peak ${ctHH(r.ml_max_hh)}${
+                  <td style="padding:9px 8px; font-weight:600; white-space:nowrap;">${r.day}
+                      <div style="${CT_SUB} font-weight:400;">${r.date}</div>${partial}</td>
+                  <td style="padding:9px 8px;">${ctNum(r.ml_10z)} \u2192 <strong>${ctNum(r.ml_max)}</strong> ft
+                      <div style="${CT_SUB}">peak ${ctHH(r.ml_max_hh)}${
                         r.cap_dtheta == null ? '' : ` &middot; cap +${r.cap_dtheta}K`}</div></td>
                   <td style="padding:8px 6px;">${brk}</td>
                   <td style="padding:8px 6px;">${ctNum(r.mom_mean, 1)}${r.mom_mean == null ? '' : ' kt'}</td>
-                  <td style="padding:8px 6px;">${ctMomChip(r.mom_max)}
-                      <div style="font-size:0.7rem; color:#64748b; margin-top:2px;">at ${ctHH(r.mom_max_hh)}</div></td>
+                  <td style="padding:9px 8px;">${ctMomChip(r.mom_max)}
+                      <div style="${CT_SUB}">at ${ctHH(r.mom_max_hh)}</div></td>
                   <td style="padding:8px 6px;">${thick}</td>
                   <td style="padding:8px 6px;">${low}</td>
                   <td style="padding:8px 6px; white-space:nowrap;">${ctNum(r.h0c, 1)} / ${ctNum(r.h20c, 1)} kft</td>
-                  <td style="padding:8px 6px; white-space:nowrap;">${r.mf_dir == null ? '\u2014' : Math.round(r.mf_dir) + '\u00b0/' + Math.round(r.mf_spd) + 'kt'}
-                      <div style="font-size:0.7rem; color:#64748b;">${r.regime || ''}${
-                        r.av_dir == null ? '' : ` &middot; aloft ${Math.round(r.av_dir)}\u00b0/${Math.round(r.av_spd)}kt`}</div></td>
+                  <td style="padding:9px 8px; white-space:nowrap;">${r.mf_dir == null ? '\u2014' : Math.round(r.mf_dir) + '\u00b0 / ' + Math.round(r.mf_spd) + ' kt'}
+                      <div style="${CT_SUB}">${r.regime || ''}${
+                        r.av_dir == null ? '' : `<br>aloft ${Math.round(r.av_dir)}\u00b0 / ${Math.round(r.av_spd)} kt`}</div></td>
                 </tr>`;
             });
             html += `</tbody></table>`;
             html += `<div style="font-size:0.75rem; color:#64748b; margin-top:10px; line-height:1.6;">
                 <strong>Reading it.</strong> <em>Mixing</em> is the diagnosed mixed-layer depth AGL (theta +1.5 K above
                 the surface value). A 10Z value of exactly 1,000 ft is the floor of that diagnosis, meaning
-                <em>capped</em> &mdash; not a measurement. <em>Inversion break</em> is the first hour the layer exceeds
-                ${brkFt.toLocaleString()} ft; <em>capped</em> means it never did, so momentum stays aloft and surface
-                winds stay light all day. <em>PBL Mom</em> uses the same mixed-layer diagnosis as the matrix columns, so
+                <em>capped</em> &mdash; not a measurement. <em>Inversion break</em> is the first hour
+                <strong>at or after ${String(cool.break_from_hh == null ? 10 : cool.break_from_hh).padStart(2,'0')}Z</strong>
+                that the layer exceeds ${brkFt.toLocaleString()} ft. The window matters: a UTC day at the Cape starts
+                mid-evening local, so a deep layer at 00\u201306Z is the <em>previous</em> afternoon's residual mixing,
+                not a sunrise break. <em>capped</em> means it never broke; <em>near</em> means the day peaked within 15%
+                of the threshold without crossing \u2014 a coin flip, not a forecast. The day <em>peak</em> still scans
+                all 24 hours, so a residual layer stays visible in the Mixing column even when it cannot be called a break. <em>PBL Mom</em> uses the same mixed-layer diagnosis as the matrix columns, so
                 the numbers are directly comparable. <em>Thick cloud layer</em> counts hours where a deck \u2265 4,500 ft
                 thick overlaps the 0\u00b0C to \u221220\u00b0C band, or where the in-band portion alone reaches 4,500 ft.</div>`;
             document.getElementById('ltBody').innerHTML = html;
