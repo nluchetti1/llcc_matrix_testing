@@ -305,7 +305,11 @@
                 modelCycles = payload.model_cycles || null;   // {site: {model: 'YYYYMMDDHH'}}
                 panelCycles = payload.panel_cycles || null;   // {model: 'YYYYMMDDHH'} panel-only ensembles
                 refcMaps = payload.refc_maps || null;
-                ivtMaps = payload.ivt_maps || null;
+                // Fallback only. The live source is ivt_maps.json, written by run_ivt.yml on
+                // its own schedule; this key is still honoured for runs made with
+                // IVT_IN_PIPELINE=1.
+                ivtMaps = (payload.ivt_maps && Object.keys(payload.ivt_maps).length)
+                          ? payload.ivt_maps : null;
 
                 // Diagnostic: how many hours carry a real calibrated-thunder map per window.
                 const countReal = (o) => !o ? 0 : Object.values(o).filter(Boolean).length;
@@ -316,6 +320,7 @@
                             '| blankBasemap:', hrefBlankMap || '(none)');
                 buildTimelineNav();
                 loadRunIndex(0); // index 0 is always the most recent run
+                loadIvtIndex();
             } catch(e) {
                 document.getElementById("view-title").innerText = "Error loading history.json pipeline";
                 console.error(e);
@@ -1321,6 +1326,116 @@
                      ${model ? `&middot; ${model.toUpperCase()} cycles every ${stepH} h` : ''}</span>`;
             el.innerHTML = html + note;
         }
+        // ---- Cool-season table ------------------------------------------------------------
+        // Every column except the airmass anchors is a DAY AGGREGATE, not a 10Z value. That is
+        // the point of the panel: "when does it mix out" and "how long is the ceiling down" are
+        // questions about a diurnal cycle. The 10Z sounding anchors the airmass and sets the
+        // isotherm band; the rest looks forward through that forecast day.
+        function ctHH(h) {
+            return (h == null) ? '<span style="color:#94a3b8;">\u2014</span>'
+                               : String(h).padStart(2, '0') + 'Z';
+        }
+        function ctNum(v, dp) {
+            return (v == null) ? '<span style="color:#94a3b8;">\u2014</span>'
+                               : (dp ? Number(v).toFixed(dp) : Math.round(v).toLocaleString());
+        }
+        function ctChip(txt, bg, fg) {
+            return `<span style="background:${bg}; color:${fg}; padding:1px 7px; border-radius:10px; font-weight:600; white-space:nowrap;">${txt}</span>`;
+        }
+        // Momentum thresholds mirror the matrix legend's Max Momentum Layer bands (20/30/40 kt)
+        // so a number means the same thing in both places.
+        function ctMomChip(v) {
+            if (v == null) return '<span style="color:#94a3b8;">\u2014</span>';
+            if (v >= 40) return ctChip(v + ' kt', '#7c2d12', '#fff');
+            if (v >= 30) return ctChip(v + ' kt', '#ea580c', '#fff');
+            if (v >= 20) return ctChip(v + ' kt', '#fed7aa', '#7c2d12');
+            return v + ' kt';
+        }
+        function renderCoolThermo() {
+            const thermo = ltActiveThermo();
+            const cool = thermo.cool || {};
+            const sel = document.getElementById('ltModel');
+            let model = sel ? sel.value : null;
+            // The compare entry has no cool equivalent; fall back to the first real model.
+            if (!model || model === LT_CMP || !(cool.by_model || {})[model]) {
+                model = (cool.models || [])[0];
+            }
+            const rows = (cool.by_model && cool.by_model[model]) || [];
+            const brkFt = cool.mixing_break_ft || 3000;
+            const lowFt = cool.low_ceiling_ft || 3000;
+
+            let html = `<div style="font-size:0.8rem; color:#475569; margin:2px 0 8px; line-height:1.5;">
+                <strong>Cool season (Nov\u2013Mar).</strong> Convective indices are dropped &mdash; deep convection is
+                rare at the Cape in winter and the Cizek forest is a warm-season model. What scrubs instead is the
+                <strong>Thick Cloud Layer rule</strong> on frontal stratiform decks, low stratocumulus, and surface winds
+                from momentum mixed down once the nocturnal inversion breaks.
+                <br>Only the two rightmost <em>airmass</em> columns are 10Z values. Everything else is aggregated across
+                that forecast day's hours, so <em>max</em> means the day's peak and the hour beside it is when.</div>`;
+
+            html += `<table style="width:100%; border-collapse:collapse; font-size:0.86rem;">
+              <thead><tr style="background:#f1f5f9; text-align:left;">
+                <th style="padding:8px 6px;">Day</th>
+                <th style="padding:8px 6px;" title="Mixed-layer depth AGL at 10Z, the day's peak, and the hour the layer first exceeds ${brkFt.toLocaleString()} ft">Mixing (10Z \u2192 max)</th>
+                <th style="padding:8px 6px;" title="Inversion break: first hour the mixed layer exceeds ${brkFt.toLocaleString()} ft AGL">Inversion break</th>
+                <th style="padding:8px 6px;" title="Day-mean of the hourly mixed-layer mean wind">PBL Mom Mean</th>
+                <th style="padding:8px 6px;" title="Day peak of the hourly mixed-layer max wind, and the hour it occurs">PBL Mom Max</th>
+                <th style="padding:8px 6px;" title="Hours violating the Thick Cloud Layer LLCC, and the thickest in-band depth">Thick cloud layer</th>
+                <th style="padding:8px 6px;" title="Lowest ceiling of the day, and how many hours sat at or below ${lowFt.toLocaleString()} ft">Low cloud</th>
+                <th style="padding:8px 6px;" title="0\u00b0C and \u221220\u00b0C heights at 10Z — these define the charging band the thick cloud rule tests">0\u00b0C / \u221220\u00b0C</th>
+                <th style="padding:8px 6px;" title="10Z transport flow: 1000\u2013700 mb mean and regime">Airmass (10Z)</th>
+              </tr></thead><tbody>`;
+
+            if (!rows.length) {
+                html += `<tr><td colspan="9" style="padding:14px 6px; color:#94a3b8;">No cool-season rows for ${String(model || '').toUpperCase()} this run.</td></tr>`;
+            }
+            rows.forEach((r, i) => {
+                const bg = i % 2 ? '#ffffff' : '#f8fafc';
+                // A day the inversion never breaks is a forecast, not a gap: momentum stays
+                // aloft and the surface stays light. Say that rather than showing a dash.
+                const brk = (r.brk_hh == null)
+                    ? ctChip('capped', '#e0e7ff', '#3730a3')
+                    : ctChip(ctHH(r.brk_hh).replace(/<[^>]*>/g, ''), '#dcfce7', '#166534');
+                const thick = r.thick_hrs
+                    ? ctChip(`${r.thick_hrs} hr${r.thick_hrs === 1 ? '' : 's'}`, '#fecaca', '#7f1d1d') +
+                      `<div style="font-size:0.7rem; color:#64748b; margin-top:2px;">max ${ctNum(r.thick_max_ft)} ft in band &middot; from ${ctHH(r.thick_first_hh)}</div>`
+                    : '<span style="color:#94a3b8;">none</span>';
+                const low = (r.ceil_min == null) ? '<span style="color:#94a3b8;">\u2014</span>'
+                    : `${r.ceil_min <= lowFt ? ctChip(ctNum(r.ceil_min) + ' ft', '#fef3c7', '#78350f') : ctNum(r.ceil_min) + ' ft'}
+                       <div style="font-size:0.7rem; color:#64748b; margin-top:2px;">min at ${ctHH(r.ceil_min_hh)} &middot; ${r.low_hrs} hr\u2264${lowFt.toLocaleString()} ft</div>`;
+                // n_hours is on the row because RAP and HRRR only reach ~18-21 h: their later
+                // days are partial, and a "day max" over 3 hours is not the same claim.
+                const partial = (r.n_hours != null && r.n_hours < 6)
+                    ? `<div style="font-size:0.68rem; color:#b45309; margin-top:2px;">partial day (${r.n_hours} hr)</div>` : '';
+                html += `<tr style="background:${bg}; border-bottom:1px solid #e2e8f0;">
+                  <td style="padding:8px 6px; font-weight:600; white-space:nowrap;">${r.day}
+                      <div style="font-size:0.7rem; color:#64748b; font-weight:400;">${r.date}</div>${partial}</td>
+                  <td style="padding:8px 6px;">${ctNum(r.ml_10z)} \u2192 <strong>${ctNum(r.ml_max)}</strong> ft
+                      <div style="font-size:0.7rem; color:#64748b;">peak ${ctHH(r.ml_max_hh)}${
+                        r.cap_dtheta == null ? '' : ` &middot; cap +${r.cap_dtheta}K`}</div></td>
+                  <td style="padding:8px 6px;">${brk}</td>
+                  <td style="padding:8px 6px;">${ctNum(r.mom_mean, 1)}${r.mom_mean == null ? '' : ' kt'}</td>
+                  <td style="padding:8px 6px;">${ctMomChip(r.mom_max)}
+                      <div style="font-size:0.7rem; color:#64748b; margin-top:2px;">at ${ctHH(r.mom_max_hh)}</div></td>
+                  <td style="padding:8px 6px;">${thick}</td>
+                  <td style="padding:8px 6px;">${low}</td>
+                  <td style="padding:8px 6px; white-space:nowrap;">${ctNum(r.h0c, 1)} / ${ctNum(r.h20c, 1)} kft</td>
+                  <td style="padding:8px 6px; white-space:nowrap;">${r.mf_dir == null ? '\u2014' : Math.round(r.mf_dir) + '\u00b0/' + Math.round(r.mf_spd) + 'kt'}
+                      <div style="font-size:0.7rem; color:#64748b;">${r.regime || ''}${
+                        r.av_dir == null ? '' : ` &middot; aloft ${Math.round(r.av_dir)}\u00b0/${Math.round(r.av_spd)}kt`}</div></td>
+                </tr>`;
+            });
+            html += `</tbody></table>`;
+            html += `<div style="font-size:0.75rem; color:#64748b; margin-top:10px; line-height:1.6;">
+                <strong>Reading it.</strong> <em>Mixing</em> is the diagnosed mixed-layer depth AGL (theta +1.5 K above
+                the surface value). A 10Z value of exactly 1,000 ft is the floor of that diagnosis, meaning
+                <em>capped</em> &mdash; not a measurement. <em>Inversion break</em> is the first hour the layer exceeds
+                ${brkFt.toLocaleString()} ft; <em>capped</em> means it never did, so momentum stays aloft and surface
+                winds stay light all day. <em>PBL Mom</em> uses the same mixed-layer diagnosis as the matrix columns, so
+                the numbers are directly comparable. <em>Thick cloud layer</em> counts hours where a deck \u2265 4,500 ft
+                thick overlaps the 0\u00b0C to \u221220\u00b0C band, or where the in-band portion alone reaches 4,500 ft.</div>`;
+            document.getElementById('ltBody').innerHTML = html;
+        }
+
         function showLaunchThermo() {
             if (!launchThermo || !(launchThermo.models || []).length) {
                 alert("No 10Z synoptic data in this run yet.");
@@ -1578,7 +1693,6 @@
             ti:   { watch: 5,    split: 10,   unit: '',     dp: 1 },
             rh:   { watch: 10,   split: 20,   unit: '%',    dp: 0 },
             pwat: { watch: 0.25, split: 0.50, unit: ' in',  dp: 2 },
-            ivt:  { watch: 75,   split: 150,  unit: '',     dp: 0 },
             ltg:  { watch: 15,   split: 30,   unit: '%',    dp: 0 },
             spd:  { watch: 8,    split: 15,   unit: ' kt',  dp: 0 },
             dir:  { watch: 40,   split: 80,   unit: '\u00b0', dp: 0 },
@@ -1588,17 +1702,6 @@
             if (a == null || b == null) return null;
             return ((a - b + 540) % 360) - 180;
         }
-        // IVT cell: magnitude over transport direction, stacked. Direction is the way the
-        // vapour is MOVING (CW3E vector convention), which is the opposite sense to every
-        // other wind field on this page -- hence the explicit arrow rather than a bare
-        // bearing that would be read as a FROM direction.
-        function ltIvtTxt(r) {
-            if (!r || r.ivt == null) return '<span style="color:#cbd5e1;">\u2014</span>';
-            const dir = (r.ivt_dir == null) ? '' :
-                `<div style="color:#94a3b8; font-weight:400; font-size:0.76rem;">\u2192 ${String(r.ivt_dir).padStart(3, '0')}\u00b0</div>`;
-            return `<span style="font-weight:600;">${Math.round(r.ivt)}</span>${dir}`;
-        }
-
         function ltDeltaChip(d, tolKey, showSign) {
             const t = LT_CMP_TOL[tolKey];
             if (d == null || !t) return '<span style="color:#cbd5e1;">\u2014</span>';
@@ -1695,12 +1798,11 @@
                     style="padding:8px 6px; cursor:pointer; text-decoration:underline dotted;">700\u2013500 mb RH</th>
                 <th onclick="showBoxPlot('pwat')" title="Click for the monthly climatology box plot"
                     style="padding:8px 6px; cursor:pointer; text-decoration:underline dotted;">PWAT (in)</th>
-                <th style="padding:8px 6px;" title="Integrated Vapor Transport, surface\u2013300 hPa">IVT</th>
                 <th style="padding:8px 6px;">Cizek Lightning</th>
               </tr></thead><tbody>`;
 
             if (!joined.length) {
-                html += `<tr><td colspan="10" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for either model this run.</td></tr>`;
+                html += `<tr><td colspan="9" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for either model this run.</td></tr>`;
             } else {
                 for (const j of joined) {
                     const a = j[S1.key] || null, b = j[S2.key] || null;
@@ -1708,7 +1810,6 @@
                     const dTi   = (a && b && a.ti != null && b.ti != null) ? a.ti - b.ti : null;
                     const dRh   = (a && b && a.ltg_rh != null && b.ltg_rh != null) ? a.ltg_rh - b.ltg_rh : null;
                     const dPw   = (a && b && a.pwat != null && b.pwat != null) ? a.pwat - b.pwat : null;
-                    const dIvt  = (a && b && a.ivt != null && b.ivt != null) ? a.ivt - b.ivt : null;
                     const dLtg  = (a && b && a.ltg != null && b.ltg != null) ? a.ltg - b.ltg : null;
                     const dMfD  = (a && b) ? ltAngDiff(a.mf_dir, b.mf_dir) : null;
                     const dMfS  = (a && b && a.mf_spd != null && b.mf_spd != null) ? a.mf_spd - b.mf_spd : null;
@@ -1738,7 +1839,6 @@
                       ${clk('thompson', j, a && a.ti, a && a.ti_pct, b && b.ti, b && b.ti_pct, numTxt(a && a.ti, 1) + pct(a && a.ti_pct))}
                       ${clk('rh75', j, a && a.ltg_rh, a && a.rh_pct, b && b.ltg_rh, b && b.rh_pct, numTxt(a && a.ltg_rh, 0, '%') + pct(a && a.rh_pct))}
                       ${clk('pwat', j, a && a.pwat, a && a.pwat_pct, b && b.pwat, b && b.pwat_pct, numTxt(a && a.pwat, 2) + pct(a && a.pwat_pct))}
-                      <td style="padding:6px;">${ltIvtTxt(a)}</td>
                       <td style="padding:6px;">${a && a.ltg != null ? a.ltg + '%' : '\u2014'}</td>
                     </tr>`;
 
@@ -1751,7 +1851,6 @@
                       ${clk('thompson', j, a && a.ti, a && a.ti_pct, b && b.ti, b && b.ti_pct, numTxt(b && b.ti, 1) + pct(b && b.ti_pct))}
                       ${clk('rh75', j, a && a.ltg_rh, a && a.rh_pct, b && b.ltg_rh, b && b.rh_pct, numTxt(b && b.ltg_rh, 0, '%') + pct(b && b.rh_pct))}
                       ${clk('pwat', j, a && a.pwat, a && a.pwat_pct, b && b.pwat, b && b.pwat_pct, numTxt(b && b.pwat, 2) + pct(b && b.pwat_pct))}
-                      <td style="padding:6px;">${ltIvtTxt(b)}</td>
                       <td style="padding:6px;">${b && b.ltg != null ? b.ltg + '%' : '\u2014'}</td>
                     </tr>`;
 
@@ -1765,7 +1864,6 @@
                       <td style="padding:6px;">${ltDeltaChip(dTi, 'ti')}</td>
                       <td style="padding:6px;">${ltDeltaChip(dRh, 'rh')}</td>
                       <td style="padding:6px;">${ltDeltaChip(dPw, 'pwat')}</td>
-                      <td style="padding:6px;">${ltDeltaChip(dIvt, 'ivt')}</td>
                       <td style="padding:6px;">${ltDeltaChip(dLtg, 'ltg')}</td>
                     </tr>`;
                 }
@@ -1780,7 +1878,44 @@
             document.getElementById('ltBody').innerHTML = html;
         }
 
+        // Which 10Z panel is showing. 'warm' is the original convective table; 'cool' is the
+        // Nov-Mar table (mixing, momentum transport, thick cloud layer, low cloud). The two are
+        // separate payloads from separate backend builders over the SAME forecast days, so the
+        // toggle swaps the columns without moving the rows.
+        let ltSeason = 'warm';
+
+        function ltHasCool() {
+            const t = ltActiveThermo();
+            return !!(t && t.cool && (t.cool.models || []).length);
+        }
+        function ltSetSeason(s) {
+            if (s === 'cool' && !ltHasCool()) {
+                alert("No cool-season data in this run yet.");
+                return;
+            }
+            ltSeason = s;
+            ltPaintSeasonButtons();
+            renderLaunchThermo();
+        }
+        function ltPaintSeasonButtons() {
+            const on  = 'border:none; padding:4px 12px; cursor:pointer; font-size:0.82rem; background:#1e3a5f; color:#fff; font-weight:600;';
+            const off = 'border:none; padding:4px 12px; cursor:pointer; font-size:0.82rem; background:#fff; color:#475569;';
+            const w = document.getElementById('ltSeasonWarm');
+            const c = document.getElementById('ltSeasonCool');
+            if (!w || !c) return;
+            w.style.cssText = (ltSeason === 'warm' ? on : off);
+            c.style.cssText = (ltSeason === 'cool' ? on : off) + 'border-left:1px solid #cbd5e1;';
+            // A run built before the cool panel existed has no cool payload. Grey the button
+            // rather than hiding it, so the feature does not appear to come and go.
+            if (!ltHasCool()) {
+                c.style.cssText = off + 'border-left:1px solid #cbd5e1; opacity:0.45; cursor:not-allowed;';
+                c.title = 'No cool-season data in this run';
+            }
+        }
+
         function renderLaunchThermo() {
+            ltPaintSeasonButtons();
+            if (ltSeason === 'cool' && ltHasCool()) { renderCoolThermo(); return; }
             // The synthetic 'GFS vs ECMWF' dropdown entry renders a different table entirely.
             if (ltIsCompare()) { renderLaunchThermoCompare(); return; }
             const thermo = ltActiveThermo();
@@ -1880,11 +2015,10 @@
                     style="padding:8px 6px; cursor:pointer; text-decoration:underline dotted;">700–500 mb RH</th>
                 <th onclick="showBoxPlot('pwat')" title="Click for the monthly climatology box plot"
                     style="padding:8px 6px; cursor:pointer; text-decoration:underline dotted;">PWAT (in)</th>
-                <th style="padding:8px 6px;" title="Integrated Vapor Transport, surface\u2013300 hPa">IVT</th>
                 <th style="padding:8px 6px;">Cizek Lightning Probability</th>
               </tr></thead><tbody>`;
             if (!rows.length) {
-                html += `<tr><td colspan="9" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for ${model.toUpperCase()} this run.</td></tr>`;
+                html += `<tr><td colspan="8" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for ${model.toUpperCase()} this run.</td></tr>`;
             } else {
                 for (const r of rows) {
                     html += `<tr style="border-bottom:1px solid #f1f5f9;">
@@ -1895,7 +2029,6 @@
                       ${clickCell('thompson', r, r.ti, r.ti_pct, `${num(r.ti)} <span style="color:#cbd5e1;">|</span> ${pct(r.ti_pct)}`)}
                       ${clickCell('rh75', r, r.ltg_rh, r.rh_pct, rhCell(r))}
                       ${clickCell('pwat', r, r.pwat, r.pwat_pct, `${num(r.pwat)} <span style="color:#cbd5e1;">|</span> ${pct(r.pwat_pct)}`)}
-                      <td style="padding:8px 6px;">${ltIvtTxt(r)}</td>
                       <td style="padding:8px 6px;">${ltgCell(r)}</td>
                     </tr>`;
                 }
@@ -3091,6 +3224,23 @@
         // its OWN init cycle: RAP runs hourly while GFS and NAM are 6-hourly, so a single
         // shared cycle label would be wrong for at least one of them.
 
+        // ivt_maps.json is written by a SEPARATE workflow on its own cadence, so it is
+        // fetched independently and may be newer or older than history.json. Failure is
+        // silent and non-fatal: the nav entry simply reports no maps.
+        async function loadIvtIndex() {
+            try {
+                const r = await fetch('ivt_maps.json?t=' + Date.now());
+                if (!r.ok) return;
+                const j = await r.json();
+                if (j && j.models && Object.keys(j.models).length) {
+                    ivtMaps = j.models;
+                    console.log('[IVT] index loaded, generated ' + (j.generated || '?'));
+                }
+            } catch (e) {
+                console.warn('ivt_maps.json unavailable:', e);
+            }
+        }
+
         function ivtModels() {
             if (!ivtMaps) return [];
             return Object.keys(ivtMaps).filter(k => ivtMaps[k] && ivtMaps[k].maps
@@ -3402,7 +3552,17 @@
          style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.55); z-index:1000; align-items:flex-start; justify-content:center;">
       <div style="background:#fff; margin-top:5vh; max-width:1180px; width:96%; max-height:88vh; overflow:auto; border-radius:10px; box-shadow:0 10px 40px rgba(0,0,0,0.3);">
         <div style="display:flex; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid #e2e8f0; position:sticky; top:0; background:#fff;">
-          <div style="font-weight:700; color:#1e3a5f;">10Z Synoptic — <span id="ltSite">KXMR</span></div>
+          <div style="display:flex; align-items:center; gap:12px;">
+            <span style="font-weight:700; color:#1e3a5f;">10Z Synoptic — <span id="ltSite">KXMR</span></span>
+            <span id="ltSeason" style="display:inline-flex; border:1px solid #cbd5e1; border-radius:6px; overflow:hidden;">
+              <button id="ltSeasonWarm" onclick="ltSetSeason('warm')"
+                      title="Convective season: Thompson, PWAT, 700–500 RH, Cizek lightning"
+                      style="border:none; padding:4px 12px; cursor:pointer; font-size:0.82rem;">Warm Season</button>
+              <button id="ltSeasonCool" onclick="ltSetSeason('cool')"
+                      title="Cool season: mixing, PBL momentum transfer, thick cloud layer, low cloud"
+                      style="border:none; padding:4px 12px; cursor:pointer; font-size:0.82rem; border-left:1px solid #cbd5e1;">Cool Season</button>
+            </span>
+          </div>
           <div style="display:flex; align-items:center; gap:8px;">
             <label style="font-size:0.85rem; color:#475569;">Model:</label>
             <select id="ltModel" onchange="ltRenderCmpPickers(); renderLaunchThermoRuns(); renderLaunchThermo();" style="padding:4px 8px; border:1px solid #cbd5e1; border-radius:6px;"></select>
