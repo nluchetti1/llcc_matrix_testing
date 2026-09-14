@@ -5433,6 +5433,23 @@ def _row_sort_key(rk):
 MIXING_BREAK_FT = 3000.0   # mixed-layer depth that counts as "inversion broken, deeply mixing"
 LOW_CEILING_FT = 3000.0    # ceiling at or below this counts as a low-cloud (stratocu) hour
 
+# Hours eligible to be called an inversion break.
+#
+# THIS WINDOW IS NOT COSMETIC. Scanning the whole UTC day produced breaks at 00Z and 04Z --
+# 7 and 11 pm EST -- which is not an inversion breaking, it is the RESIDUAL mixed layer from
+# the previous afternoon, or mechanical mixing under a windy night. A UTC day at the Cape
+# starts mid-evening local, so its first hours belong to the previous day's diurnal cycle and
+# have to be excluded or the column reports a sunrise that already happened.
+#
+# 10Z is the panel's own assessment hour and sits before winter sunrise (~11-12Z at the Cape),
+# so a break found at or after it is genuinely this day's heating. The day MAX still scans all
+# 24 hours -- a deep residual layer is real and worth seeing -- it just cannot be called a break.
+MIXING_BREAK_HOURS = range(10, 24)
+
+# compute_profile_variables returns this when no deck qualifies as a ceiling. It is a
+# sentinel, not a measurement, and printing "24,000 ft" invites reading it as a high deck.
+NO_CEILING_FT = 24000.0
+
 # Hours of the UTC day to aggregate over. A UTC day at the Cape runs from ~7 pm EST the
 # previous evening, so 00-23Z captures one full local diurnal cycle: the nocturnal inversion
 # forms early in the window, breaks around 13-15Z, and mixing peaks near 19-20Z. Grouping on
@@ -5466,7 +5483,9 @@ def _cool_season_day(profiles, anchor):
     # hourly at best and 3-hourly for several models, so a derivative would mostly measure
     # the sampling interval. None means the layer never got there, which on a Florida winter
     # day is itself the forecast: capped all day, momentum stays aloft, surface stays light.
-    brk = next((hh for hh, v in sorted(ml) if v >= MIXING_BREAK_FT), None)
+    brk = next((hh for hh, v in sorted(ml)
+                if v >= MIXING_BREAK_FT and hh in MIXING_BREAK_HOURS), None)
+    # Day peak still scans every hour (see MIXING_BREAK_HOURS).
     ml_peak = max(ml, key=lambda t: t[1]) if ml else None
     mom_peak = max(mom_max, key=lambda t: t[1]) if mom_max else None
     ceil_low = min(ceils, key=lambda t: t[1]) if ceils else None
@@ -5479,6 +5498,11 @@ def _cool_season_day(profiles, anchor):
         "ml_max": None if not ml_peak else round(ml_peak[1]),
         "ml_max_hh": None if not ml_peak else ml_peak[0],
         "brk_hh": brk,
+        # True when the day peaked within 15% of the break threshold without crossing it.
+        # A 2,991 ft peak against a 3,000 ft threshold is a coin flip, not a capped day, and
+        # rendering both as a flat "capped" chip hides the difference that matters.
+        "brk_near": bool(brk is None and ml_peak
+                         and ml_peak[1] >= MIXING_BREAK_FT * 0.85),
         # Momentum transfer
         "mom_mean": round(sum(mom_mean) / len(mom_mean), 1) if mom_mean else None,
         "mom_max": None if not mom_peak else round(mom_peak[1], 1),
@@ -5558,7 +5582,8 @@ def build_cool_season_thermo(combined_data, site="kxmr", assess_hour=10):
     pref = ["gfs", "ecmwf", "gefs", "ecens", "rrfs", "refs", "rap", "hrrr"]
     models = sorted(by_model.keys(), key=lambda m: (pref.index(m) if m in pref else 99, m))
     return {"site": site.upper(), "hour": assess_hour, "models": models, "by_model": by_model,
-            "mixing_break_ft": MIXING_BREAK_FT, "low_ceiling_ft": LOW_CEILING_FT}
+            "mixing_break_ft": MIXING_BREAK_FT, "low_ceiling_ft": LOW_CEILING_FT,
+            "no_ceiling_ft": NO_CEILING_FT, "break_from_hh": MIXING_BREAK_HOURS.start}
 
 
 def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_rows=None,
