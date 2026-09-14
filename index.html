@@ -1424,8 +1424,7 @@
                   <td style="padding:9px 8px; font-weight:600; white-space:nowrap;">${r.day}
                       <div style="${CT_SUB} font-weight:400;">${r.date}</div>${partial}</td>
                   <td style="padding:9px 8px;">${ctNum(r.ml_10z)} \u2192 <strong>${ctNum(r.ml_max)}</strong> ft
-                      <div style="${CT_SUB}">peak ${ctHH(r.ml_max_hh)}${
-                        r.cap_dtheta == null ? '' : ` &middot; cap +${r.cap_dtheta}K`}</div></td>
+                      <div style="${CT_SUB}">peak ${ctHH(r.ml_max_hh)}</div></td>
                   <td style="padding:8px 6px;">${brk}</td>
                   <td style="padding:8px 6px;">${ctNum(r.mom_mean, 1)}${r.mom_mean == null ? '' : ' kt'}</td>
                   <td style="padding:9px 8px;">${ctMomChip(r.mom_max)}
