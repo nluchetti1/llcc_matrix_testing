@@ -2035,6 +2035,9 @@ def compute_profile_variables(profile_layers):
             break
     if ml_top_ft is None:
         ml_top_ft = profile_layers[-1]["hght"]
+    # Keep the raw diagnosis before clamping. The clamp below is correct for the momentum
+    # columns and destructive for erosion detection, so both values are carried from here on.
+    _ml_raw_ft = ml_top_ft
     # Clamp the diagnosed top into a sane AGL band
     ml_top_ft = max(sfc_hght + MIN_ML_TOP_FT, min(ml_top_ft, sfc_hght + MAX_ML_TOP_FT))
 
@@ -2080,10 +2083,48 @@ def compute_profile_variables(profile_layers):
     # as "capped", not as a measurement.
     _ml_agl = max(0.0, ml_top_ft - sfc_hght)
 
+    # ---- Near-surface mixing, for the inversion-EROSION column -------------------------
+    # The clamped depth above is right for the momentum columns -- averaging winds through a
+    # 300 ft layer gives you two levels and a meaningless mean -- but it is exactly wrong for
+    # erosion, because MIN_ML_TOP_FT flattens every genuinely shallow layer to the same 1,000 ft
+    # constant and destroys the signal before anything downstream sees it.
+    #
+    # So diagnose erosion separately and directly: is the lowest EROSION_DEPTH_FT well mixed?
+    # Theta is conserved under dry mixing, so a near-zero theta spread across that layer means
+    # the surface is connected to it -- which is what BUFKIT is showing when the nocturnal
+    # inversion visibly erodes and the mixed layer starts being highlighted from the ground up.
+    EROSION_DEPTH_FT = 500.0    # layer depth AGL tested for "well mixed"
+    EROSION_DTHETA_K = 0.5      # theta spread across it that still counts as mixed
+    EROSION_MIN_LEVELS = 2      # levels needed inside the test depth to evaluate it at all
+
+    _target = sfc_hght + EROSION_DEPTH_FT
+    _in_layer = [l for l in profile_layers if sfc_hght <= l["hght"] <= _target]
+    # RESOLUTION GUARD. On mandatory isobaric levels the lowest samples sit near the surface,
+    # ~1,000 ft and ~1,800 ft, so nothing is available inside a 500 ft test layer and a
+    # nocturnal inversion erodes entirely between two samples. REFS is worse: its lowest level
+    # is 925 mb, about 2,500 ft. Those columns must report "cannot tell" rather than a number
+    # that looks like a measurement -- a confident wrong erosion hour is worse than a blank.
+    _ero_ok = len(_in_layer) >= EROSION_MIN_LEVELS
+    _ll_mixed = None
+    if _ero_ok:
+        # Theta at the test height, interpolated between the bracketing levels.
+        _above = next((l for l in profile_layers if l["hght"] >= _target), None)
+        _below = _in_layer[-1]
+        if _above is not None and _above["hght"] > _below["hght"]:
+            _f = (_target - _below["hght"]) / (_above["hght"] - _below["hght"])
+            _theta_t = _theta_k(_below) + _f * (_theta_k(_above) - _theta_k(_below))
+        else:
+            _theta_t = _theta_k(_below)
+        _ll_mixed = bool((_theta_t - sfc_theta) < EROSION_DTHETA_K)
+
     return {
         "mom_mean": round(mean_wind, 1),
         "mom_max": round(max_pbl, 1),
         "ml_top_agl": round(_ml_agl),
+        # Unclamped depth: the cool panel's erosion logic needs the real number, not the floor.
+        "ml_raw_agl": round(max(0.0, _ml_raw_ft - sfc_hght)),
+        "ll_mixed": _ll_mixed,          # None = profile too coarse to say
+        "ll_levels": len(_in_layer),    # how many levels were actually inside the test layer
         "shear": calc_shear_0_6km(),
         "vis": vis,
         "ceiling": ceiling_val,
@@ -5412,6 +5453,183 @@ def _row_sort_key(rk):
     except Exception:
         return (999, 999)
 
+# ---- GFS MEX MOS: overnight low temperature -------------------------------------------
+# WHY MEX AND NOT MAV. MAV is the short-range GFS MOS and stops at 72 h; this panel runs out
+# past 8 days, so most rows would be blank. MEX (GFSX) reaches 192 h, which covers the panel,
+# and carries daily max/min directly as an X/N line rather than something to derive.
+#
+# WHY THE AF FILE FIRST. mdl_gfsafmex is the Air Force station subset -- ~346 KB against
+# ~3.1 MB for the full mdl_gfsmex -- and XMR is an Air Force site, so it should be carried
+# there. The full file is the fallback if it is not. MEX runs 00Z and 12Z only, unlike MAV's
+# four cycles, so the candidate list walks back through recent cycles rather than assuming
+# one is posted.
+#
+# WHY THIS IS WORTH A COLUMN. MOS is statistically bias-corrected to the station, so it is a
+# better overnight low than raw model 2 m temperature, and it is an INDEPENDENT check on the
+# rest of the row: a strong radiational-cooling night means a strong surface inversion, which
+# means later erosion and momentum held aloft longer. A MOS low sitting next to the Erosion
+# column tells you whether the model's inversion story is consistent with its own temperature
+# forecast.
+MOS_ENABLED = True
+MOS_STATION = "KXMR"          # must be a MEX station; see MOS_STATION_FALLBACKS
+# If XMR is not carried in MEX, these are the nearby substitutes in preference order. The
+# frontend shows which station a value came from, because a Melbourne low is not a Cape low
+# on a radiational night -- that difference is the whole point of the column.
+MOS_STATION_FALLBACKS = ["KTTS", "KCOF", "KMLB"]
+MOS_BASE = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs_mos/prod"
+MOS_FILES = ["mdl_gfsafmex", "mdl_gfsmex"]   # AF subset first (10x smaller), then full
+MOS_CYCLES = [0, 12]          # MEX is 00Z/12Z only
+MOS_MAX_CYCLE_AGE_H = 30      # how far back to walk looking for a posted bulletin
+MOS_PLAUSIBLE_F = (-40, 130)  # sanity band; anything outside is a parse error, not weather
+
+
+def _mos_station_block(text, station):
+    """Return the lines of one station's bulletin, or None."""
+    lines = text.splitlines()
+    start = None
+    for i, ln in enumerate(lines):
+        # The header line names the station and the product. Match on both so a station id
+        # appearing inside another block's data cannot trigger a false start.
+        if ln.strip().startswith(station) and "MOS GUIDANCE" in ln.upper():
+            start = i
+            break
+    if start is None:
+        return None
+    out = [lines[start]]
+    for ln in lines[start + 1:]:
+        if ln.strip() and "MOS GUIDANCE" in ln.upper():
+            break            # next station
+        out.append(ln)
+    return out
+
+
+def _mos_row_tokens(lines, labels):
+    """Find a labelled row and return [(column_index, token)] for its data tokens.
+
+    POSITIONS, NOT ORDER, are what align a value to its forecast hour. MEX is fixed-width and
+    the offsets are NOT hardcoded here: writing them from memory is how you end up with a
+    column full of plausible-looking wrong numbers. Recording where each token sits and later
+    matching an X/N token to the nearest FHR token by character position reaches the same
+    answer without depending on any particular layout, and survives the bulletin being spaced
+    differently than expected.
+    """
+    for ln in lines:
+        stripped = ln.lstrip()
+        if not stripped:
+            continue
+        label = stripped.split()[0].upper()
+        if label not in labels:
+            continue
+        # Tokenise everything after the label, keeping absolute column indices.
+        off = ln.index(stripped.split()[0]) + len(stripped.split()[0])
+        # MEX separates 12-hour periods with "|", which sticks to the adjacent token
+        # ("36|", "71|"). Strip the separator here so downstream int() sees a number;
+        # tokens that are nothing but separators drop out.
+        toks = []
+        for m in re.finditer(r"\S+", ln[off:]):
+            t = m.group().strip("|").strip()
+            if t:
+                toks.append((m.start() + off, t))
+        return toks
+    return None
+
+
+def parse_mex_lows(text, station, cycle_dt):
+    """Extract {YYYYMMDD: low_F} for one station from a MEX bulletin.
+
+    MIN vs MAX IS DECIDED BY VALUE, NOT BY POSITION. The X/N line alternates max and min, and
+    which one comes first depends on the cycle -- a detail I would otherwise be encoding from
+    memory and getting silently wrong half the time, swapping every high and low in the
+    column. Instead: group the day's X/N values by the calendar day of their valid time and
+    take the smaller. A day with both values gives an unambiguous low regardless of ordering.
+    Days with only one value (the truncated first and last days of the bulletin) are DROPPED,
+    because a lone value cannot be identified as a max or a min and a guess there is exactly
+    the failure this avoids.
+    """
+    lines = _mos_station_block(text, station)
+    if not lines:
+        return {}
+    fhr = _mos_row_tokens(lines, {"FHR", "HR"})
+    xn = _mos_row_tokens(lines, {"X/N", "N/X"})
+    if not fhr or not xn:
+        return {}
+    by_day = {}
+    for col, tok in xn:
+        try:
+            val = int(tok)
+        except ValueError:
+            continue
+        if not (MOS_PLAUSIBLE_F[0] <= val <= MOS_PLAUSIBLE_F[1]):
+            continue
+        # Nearest forecast-hour token by character position.
+        near = min(fhr, key=lambda f: abs(f[0] - col))
+        if abs(near[0] - col) > 4:
+            continue
+        try:
+            hours = int(near[1])
+        except ValueError:
+            continue
+        valid = cycle_dt + datetime.timedelta(hours=hours)
+        by_day.setdefault(valid.strftime("%Y%m%d"), []).append(val)
+    return {d: min(v) for d, v in by_day.items() if len(v) >= 2}
+
+
+def fetch_mos_lows(station=None):
+    """Fetch the most recent MEX bulletin and return (lows, meta) or ({}, None).
+
+    Degrades quietly and completely: every failure path returns an empty dict, the cool panel
+    renders without the column, and the run carries on. MOS is a nice-to-have reference value,
+    never a reason to fail a build.
+    """
+    if not MOS_ENABLED:
+        return {}, None
+    stations = [station or MOS_STATION] + [s for s in MOS_STATION_FALLBACKS
+                                           if s != (station or MOS_STATION)]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    # Candidate cycles, newest first, walking back MOS_MAX_CYCLE_AGE_H.
+    cands = []
+    probe = now.replace(minute=0, second=0, microsecond=0)
+    for back in range(0, MOS_MAX_CYCLE_AGE_H + 1):
+        t = probe - datetime.timedelta(hours=back)
+        if t.hour in MOS_CYCLES:
+            cands.append(t)
+    for cyc in cands:
+        for fname in MOS_FILES:
+            url = (f"{MOS_BASE}/gfs_mos.{cyc.strftime('%Y%m%d')}/"
+                   f"{fname}.t{cyc.hour:02d}z")
+            try:
+                r = requests.get(url, timeout=45,
+                                 headers={"User-Agent": BUFKIT_USER_AGENT})
+                if r.status_code != 200 or len(r.text) < 1000:
+                    continue
+            except Exception as e:
+                logging.debug(f"[MOS] {url} failed: {e}")
+                continue
+            for st in stations:
+                lows = parse_mex_lows(r.text, st, cyc)
+                if lows:
+                    meta = {"station": st, "cycle": cyc.strftime("%Y%m%d %Hz"),
+                            "file": fname, "days": len(lows),
+                            "substitute": st != (station or MOS_STATION)}
+                    logging.info(f"[MOS] {st} from {fname}.t{cyc.hour:02d}z "
+                                 f"({cyc:%Y-%m-%d}): {len(lows)} daily lows "
+                                 f"{sorted(lows.items())[:3]}...")
+                    if meta["substitute"]:
+                        logging.warning(f"[MOS] {station or MOS_STATION} not found in MEX; "
+                                        f"using {st} as a substitute. Its overnight low will "
+                                        f"differ from the launch site's on radiational nights.")
+                    # Raw block for the FIRST run, so the column can be verified against the
+                    # bulletin rather than trusted on faith. This parser was written without a
+                    # live sample; these lines are how you check it before relying on it.
+                    blk = _mos_station_block(r.text, st) or []
+                    for ln in blk[:6]:
+                        logging.info(f"[MOS RAW] {ln.rstrip()}")
+                    return lows, meta
+            logging.info(f"[MOS] no matching station in {fname}.t{cyc.hour:02d}z")
+    logging.info("[MOS] no usable MEX bulletin found; column will be omitted.")
+    return {}, None
+
+
 # ---- Cool-season panel ----------------------------------------------------------------
 # The warm-season panel answers "will it be convective?" -- Thompson, PWAT, the Cizek forest.
 # From roughly November through March at the Cape those are the wrong questions: deep
@@ -5426,21 +5644,39 @@ def _row_sort_key(rk):
 # anchor -- it is the observed initialization and it sets the isotherm band -- but the panel
 # is allowed to look forward through the day from there.
 
-MIXING_BREAK_FT = 3000.0   # mixed-layer depth that counts as "inversion broken, deeply mixing"
+# Mixed-layer depth at which momentum from aloft starts reaching the surface.
+#
+# THIS IS NOT AN INVERSION-BREAK CRITERION AND THE COLUMN NO LONGER CLAIMS IT IS. A nocturnal
+# inversion at the Cape routinely erodes with the mixed layer still under 1,500 ft; calling
+# that "not broken" would be wrong. What this threshold answers is the separate and also
+# useful question of when the layer gets deep enough to tap the momentum reservoir above,
+# which is why it sits beside the PBL Mom columns.
+#
+# It cannot be a true break detector, because of the clamp below: MIN_ML_TOP_FT pins the
+# diagnosis at 1,000 ft, so every profile shallower than that -- i.e. most of a real
+# nocturnal inversion -- reports the same constant. "First hour the layer rises off its
+# overnight minimum" is therefore undetectable; the minimum is a floor, not a measurement.
+# Resolution bites too: on mandatory isobaric levels the lowest samples are roughly surface,
+# 1,000 ft and 1,800 ft, so a 700 ft inversion sits entirely between two levels and its
+# erosion is invisible no matter what test is applied.
+#
+# 3,000 ft was chosen to clear the 1,000 ft clamp with margin, NOT from Cape soundings.
+# Expect to retune it after a few real cold-season mornings.
+DEEP_MIX_FT = 3000.0
 LOW_CEILING_FT = 3000.0    # ceiling at or below this counts as a low-cloud (stratocu) hour
 
-# Hours eligible to be called an inversion break.
+# Hours eligible to be called deep-mixing onset.
 #
-# THIS WINDOW IS NOT COSMETIC. Scanning the whole UTC day produced breaks at 00Z and 04Z --
-# 7 and 11 pm EST -- which is not an inversion breaking, it is the RESIDUAL mixed layer from
-# the previous afternoon, or mechanical mixing under a windy night. A UTC day at the Cape
-# starts mid-evening local, so its first hours belong to the previous day's diurnal cycle and
-# have to be excluded or the column reports a sunrise that already happened.
+# THIS WINDOW IS NOT COSMETIC. Scanning the whole UTC day produced onsets at 00Z and 04Z --
+# 7 and 11 pm EST -- which is not this day mixing out, it is the RESIDUAL mixed layer from the
+# previous afternoon, or mechanical mixing under a windy night. A UTC day at the Cape starts
+# mid-evening local, so its first hours belong to the previous day's diurnal cycle and have to
+# be excluded or the column reports a sunrise that already happened.
 #
 # 10Z is the panel's own assessment hour and sits before winter sunrise (~11-12Z at the Cape),
-# so a break found at or after it is genuinely this day's heating. The day MAX still scans all
-# 24 hours -- a deep residual layer is real and worth seeing -- it just cannot be called a break.
-MIXING_BREAK_HOURS = range(10, 24)
+# so an onset at or after it is genuinely this day's heating. The day MAX still scans all 24
+# hours -- a deep residual layer is real and worth seeing -- it just cannot be called an onset.
+DEEP_MIX_HOURS = range(10, 24)
 
 # compute_profile_variables returns this when no deck qualifies as a ceiling. It is a
 # sentinel, not a measurement, and printing "24,000 ft" invites reading it as a high deck.
@@ -5460,7 +5696,12 @@ def _cool_season_day(profiles, anchor):
     Returns the metrics dict, or None when the day carries nothing usable.
     """
     ml, mom_mean, mom_max, ceils, thick = [], [], [], [], []
+    mixed, raw = [], []
     for hh, p in profiles:
+        if p.get("ll_mixed") is not None:
+            mixed.append((hh, bool(p["ll_mixed"])))
+        if p.get("ml_raw_agl") is not None:
+            raw.append((hh, float(p["ml_raw_agl"])))
         if p.get("ml_top_agl") is not None:
             ml.append((hh, float(p["ml_top_agl"])))
         if p.get("mom_mean") is not None:
@@ -5474,14 +5715,50 @@ def _cool_season_day(profiles, anchor):
     if not (ml or mom_max or ceils):
         return None
 
-    # Inversion break: the FIRST hour the mixed layer gets deeper than MIXING_BREAK_FT.
-    # Deliberately a threshold crossing rather than a rate of change -- the profiles are
-    # hourly at best and 3-hourly for several models, so a derivative would mostly measure
-    # the sampling interval. None means the layer never got there, which on a Florida winter
-    # day is itself the forecast: capped all day, momentum stays aloft, surface stays light.
+    # Inversion erosion: first hour in the window where the lowest 500 ft is well mixed.
+    # Distinct from deep mixing and usually EARLIER -- at the Cape in winter the nocturnal
+    # inversion routinely erodes with the layer still under 1,500 ft, which is why the deep-mix
+    # threshold could never answer this. `ero_res` is False when every profile this day was too
+    # coarse to evaluate, so the column can blank instead of implying it looked and found nothing.
+    ero_res = bool(mixed)
+    win = [(hh, m) for hh, m in sorted(mixed) if hh in DEEP_MIX_HOURS]
+    ero = next((hh for hh, m in win if m), None)
+    # Already mixed at the first hour of the window means it never restratified overnight, which
+    # is a different statement from "eroded at 10Z" and worth keeping separate.
+    ero_already = bool(win and win[0][1] and ero == win[0][0])
+    raw_10z = None
+    if raw:
+        _near = sorted(raw, key=lambda t: (abs(t[0] - 10), t[0]))
+        raw_10z = round(_near[0][1]) if _near else None
+
+    # Deep-mixing onset: the first hour the layer is deep enough AND the surface is connected
+    # to it.
+    #
+    # THE SURFACE-CONNECTION TEST IS NOT OPTIONAL, and leaving it out produced onsets EARLIER
+    # than erosion -- which is impossible if the column means what it claims. The cause is the
+    # RESIDUAL LAYER: overnight, yesterday's mixed layer survives aloft as a deep neutral slab
+    # while a thin stable layer forms beneath it at the ground. The theta walk starts at the
+    # surface and climbs until it gains 1.5 K, so a weak 0.8 K surface inversion does not stop
+    # it -- it sails through and reports a 3,500 ft "mixed layer" at 10Z. The depth is real;
+    # the connection to the ground is not, and momentum in that slab is not reaching the
+    # surface while the stable layer is still there.
+    #
+    # Requiring ll_mixed at the same hour makes the column mean "momentum can now reach the
+    # surface" and guarantees onset >= erosion by construction.
+    _mixed_at = dict(mixed)
     brk = next((hh for hh, v in sorted(ml)
-                if v >= MIXING_BREAK_FT and hh in MIXING_BREAK_HOURS), None)
-    # Day peak still scans every hour (see MIXING_BREAK_HOURS).
+                if v >= DEEP_MIX_FT and hh in DEEP_MIX_HOURS
+                and (_mixed_at.get(hh) is not False)), None)
+    # Note the `is not False`: on a profile too coarse to evaluate, ll_mixed is None and the
+    # gate cannot be applied, so it falls back to depth alone rather than blanking a column
+    # that was working before. ero_res tells the frontend which regime a row is in.
+
+    # Residual layer at 10Z: deep by the theta walk, but the surface is still decoupled. Worth
+    # surfacing on its own -- it says there IS momentum stored aloft waiting for the inversion
+    # to go, which is a different morning from a genuinely shallow one.
+    resid_10z = bool(raw_10z is not None and raw_10z >= DEEP_MIX_FT
+                     and _mixed_at.get(10) is False)
+
     ml_peak = max(ml, key=lambda t: t[1]) if ml else None
     mom_peak = max(mom_max, key=lambda t: t[1]) if mom_max else None
     ceil_low = min(ceils, key=lambda t: t[1]) if ceils else None
@@ -5493,11 +5770,16 @@ def _cool_season_day(profiles, anchor):
         "ml_max": None if not ml_peak else round(ml_peak[1]),
         "ml_max_hh": None if not ml_peak else ml_peak[0],
         "brk_hh": brk,
-        # True when the day peaked within 15% of the break threshold without crossing it.
-        # A 2,991 ft peak against a 3,000 ft threshold is a coin flip, not a capped day, and
-        # rendering both as a flat "capped" chip hides the difference that matters.
+        "ero_hh": ero,
+        "ero_res": ero_res,
+        "ero_already": ero_already,
+        "ml_raw_10z": raw_10z,
+        "resid_10z": resid_10z,
+        # True when the day peaked within 15% of the threshold without crossing it. A 2,991 ft
+        # peak against a 3,000 ft threshold is a coin flip, not a shallow day, and rendering
+        # both as a flat "shallow" chip hides the difference that matters.
         "brk_near": bool(brk is None and ml_peak
-                         and ml_peak[1] >= MIXING_BREAK_FT * 0.85),
+                         and ml_peak[1] >= DEEP_MIX_FT * 0.85),
         # Momentum transfer
         "mom_mean": round(sum(mom_mean) / len(mom_mean), 1) if mom_mean else None,
         "mom_max": None if not mom_peak else round(mom_peak[1], 1),
@@ -5516,7 +5798,7 @@ def _cool_season_day(profiles, anchor):
     }
 
 
-def build_cool_season_thermo(combined_data, site="kxmr", assess_hour=10):
+def build_cool_season_thermo(combined_data, site="kxmr", assess_hour=10, mos=None):
     """Cool-season companion to build_launch_thermo. Same {model: [day rows]} shape.
 
     Shares the warm panel's day/anchor selection so the two tables line up row for row --
@@ -5524,6 +5806,7 @@ def build_cool_season_thermo(combined_data, site="kxmr", assess_hour=10):
     is comparing like with like rather than re-reading the axis.
     """
     now = datetime.datetime.now(datetime.timezone.utc)
+    mos_lows, mos_meta = (mos if mos is not None else ({}, None))
     site_models = combined_data.get(site, {}) or {}
     by_model = {}
     for model, rows in site_models.items():
@@ -5566,6 +5849,10 @@ def build_cool_season_thermo(combined_data, site="kxmr", assess_hour=10):
                 "regime": (th or {}).get("mf_regime"),
                 "engine": (th or {}).get("engine"),
             }
+            # MOS low, keyed on the row's own sort key (YYYYMMDD) so alignment is by DATE
+            # and cannot drift with model, cycle or row order.
+            if mos_lows:
+                row["mos_low"] = mos_lows.get(sort_key)
             row.update(metrics)
             day_rows.append(row)
         if day_rows:
@@ -5577,8 +5864,10 @@ def build_cool_season_thermo(combined_data, site="kxmr", assess_hour=10):
     pref = ["gfs", "ecmwf", "gefs", "ecens", "rrfs", "refs", "rap", "hrrr"]
     models = sorted(by_model.keys(), key=lambda m: (pref.index(m) if m in pref else 99, m))
     return {"site": site.upper(), "hour": assess_hour, "models": models, "by_model": by_model,
-            "mixing_break_ft": MIXING_BREAK_FT, "low_ceiling_ft": LOW_CEILING_FT,
-            "no_ceiling_ft": NO_CEILING_FT, "break_from_hh": MIXING_BREAK_HOURS.start}
+            "mixing_break_ft": DEEP_MIX_FT, "low_ceiling_ft": LOW_CEILING_FT,
+            "no_ceiling_ft": NO_CEILING_FT, "break_from_hh": DEEP_MIX_HOURS.start,
+            "erosion_depth_ft": 500.0, "erosion_dtheta_k": 0.5,
+            "mos": mos_meta}
 
 
 def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_rows=None,
@@ -6017,8 +6306,15 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         # Its own try/except: a cool-panel failure must not cost the warm panel, which is the
         # one people look at for eight months of the year.
         try:
+            # One MOS fetch per run, shared by every model column -- it is a single
+            # bias-corrected reference value per day, not a per-model forecast.
+            try:
+                _mos = fetch_mos_lows()
+            except Exception as e:
+                logging.warning(f"[MOS] fetch failed, column omitted: {e}")
+                _mos = ({}, None)
             launch_thermo["cool"] = build_cool_season_thermo(combined_data, site="kxmr",
-                                                             assess_hour=10)
+                                                             assess_hour=10, mos=_mos)
             _c = launch_thermo["cool"]
             logging.info(f"Cool-season thermo: {len(_c['models'])} models, "
                          f"rows/model={ {m: len(_c['by_model'][m]) for m in _c['models']} }")
